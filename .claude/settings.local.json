@@ -4,7 +4,9 @@
       "Bash(git init:*)",
       "Bash(git add:*)",
       "Bash(git commit -m 'docs: add NetScope SDK design spec:*)",
-      "Bash(git commit -m 'docs: update integration section with Maven + local AAR options:*)"
+      "Bash(git commit -m 'docs: update integration section with Maven + local AAR options:*)",
+      "Bash(git -C /Users/bdgong/WorkSpace/GitRepositories/NetScope add .)",
+      "Bash(git -C /Users/bdgong/WorkSpace/GitRepositories/NetScope commit -m \"docs: add implementation plan \\(11 tasks, TDD, full code\\)\")"
     ]
   }
 }
