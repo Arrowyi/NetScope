@@ -215,12 +215,41 @@ Tag: `NetScope`
 
 ## 10. 使用方法
 
-### 集成（build.gradle）
+### 集成方式一：Maven 仓库（推荐用于正式发布）
 
 ```groovy
+// settings.gradle
+dependencyResolutionManagement {
+    repositories {
+        maven { url 'https://your-maven-repo/releases' } // 私有 Maven 或 MavenCentral
+    }
+}
+
+// build.gradle (app module)
 dependencies {
     implementation 'com.netscope:netscope-sdk:1.0.0'
 }
+```
+
+发布命令（SDK 模块执行）：
+```bash
+./gradlew :netscope-sdk:publishReleasePublicationToMavenRepository
+```
+
+### 集成方式二：本地 AAR 文件（适用于离线环境 / 车机工程直接集成）
+
+```groovy
+// 将编译好的 netscope-sdk-release.aar 放入 app/libs/
+dependencies {
+    implementation files('libs/netscope-sdk-release.aar')
+    // AAR 中 Native .so 已内嵌，无需额外配置
+}
+```
+
+构建 AAR：
+```bash
+./gradlew :netscope-sdk:assembleRelease
+# 产物：netscope-sdk/build/outputs/aar/netscope-sdk-release.aar
 ```
 
 ### 初始化
