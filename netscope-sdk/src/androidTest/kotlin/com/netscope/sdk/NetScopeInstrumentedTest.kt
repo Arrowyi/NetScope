@@ -113,4 +113,30 @@ class NetScopeInstrumentedTest {
         System.loadLibrary("netscope")
         assertNull(NetScopeNative.testFlowGetDomain(9999))
     }
+
+    @Test
+    fun testStatsAggregatorCumulative() {
+        System.loadLibrary("netscope")
+        NetScopeNative.testStatsClear()
+        NetScopeNative.testStatsFlush("api.example.com", 1000L, 2000L)
+        NetScopeNative.testStatsFlush("api.example.com", 500L, 300L)
+        val stats = NetScopeNative.testStatsGetCumulative()
+        val entry = stats.firstOrNull { it.contains("api.example.com") }
+        assertNotNull(entry)
+        assertTrue(entry!!.contains("tx=1500"))
+        assertTrue(entry.contains("rx=2300"))
+    }
+
+    @Test
+    fun testStatsAggregatorInterval() {
+        System.loadLibrary("netscope")
+        NetScopeNative.testStatsClear()
+        NetScopeNative.testStatsFlush("cdn.example.com", 400L, 800L)
+        NetScopeNative.testStatsMark()  // mark boundary
+        NetScopeNative.testStatsFlush("cdn.example.com", 100L, 200L)  // new interval
+        val snap = NetScopeNative.testStatsGetInterval()  // last completed interval
+        val entry = snap.firstOrNull { it.contains("cdn.example.com") }
+        assertNotNull(entry)
+        assertTrue(entry!!.contains("tx=400"))  // snapshot had 400, not 100
+    }
 }

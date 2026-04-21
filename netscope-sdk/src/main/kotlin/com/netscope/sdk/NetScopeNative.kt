@@ -17,4 +17,10 @@ internal object NetScopeNative {
     external fun testFlowGetDomain(fd: Int): String?
     external fun testFlowGetTx(fd: Int): Long
     external fun testFlowGetRx(fd: Int): Long
+
+    external fun testStatsClear()
+    external fun testStatsFlush(domain: String, tx: Long, rx: Long)
+    external fun testStatsMark()
+    external fun testStatsGetCumulative(): Array<String>
+    external fun testStatsGetInterval(): Array<String>
 }
