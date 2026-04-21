@@ -33,6 +33,18 @@ void StatsAggregator::flush(const std::string& domain, uint64_t tx, uint64_t rx)
     }
     // Slow path: new domain
     std::unique_lock<std::shared_mutex> wlock(records_mutex_);
+    // Re-check under write lock (another thread may have inserted between our two locks)
+    auto it2 = records_.find(domain);
+    if (it2 != records_.end()) {
+        it2->second.tx_total    += tx;
+        it2->second.rx_total    += rx;
+        it2->second.count_total += 1;
+        it2->second.tx_curr     += tx;
+        it2->second.rx_curr     += rx;
+        it2->second.count_curr  += 1;
+        it2->second.last_active_ms.store(now_ms());
+        return;
+    }
     auto& r = records_[domain];
     r.tx_total    = tx;
     r.rx_total    = rx;
