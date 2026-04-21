@@ -41,6 +41,7 @@ object NetScope {
      * Uninstall all PLT hooks and release native resources.
      * Typically not needed — only call when you want to completely remove the SDK.
      */
+    @Synchronized
     fun destroy() {
         NetScopeNative.nativeDestroy()
         LogcatReporter.stop()
@@ -86,7 +87,7 @@ object NetScope {
      * The [DomainStats] parameter's txBytesInterval/rxBytesInterval reflect the delta
      * for that single connection. Keep the callback lightweight.
      */
-    fun setOnFlowEnd(callback: (DomainStats) -> Unit) {
+    fun setOnFlowEnd(callback: ((DomainStats) -> Unit)?) {
         NetScopeNative.nativeSetFlowEndCallback(callback)
     }
 }

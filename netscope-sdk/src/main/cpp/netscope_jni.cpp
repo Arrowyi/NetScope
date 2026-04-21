@@ -113,6 +113,7 @@ Java_com_netscope_sdk_NetScopeNative_nativeSetFlowEndCallback(JNIEnv* env, jobje
         jclass cls = env2->FindClass("com/netscope/sdk/DomainStats");
         if (!cls) { g_jvm->DetachCurrentThread(); return; }
         jmethodID ctor = env2->GetMethodID(cls, "<init>", "(Ljava/lang/String;JJJJIIJ)V");
+        if (!ctor) { env2->DeleteLocalRef(cls); g_jvm->DetachCurrentThread(); return; }
         jobject obj = env2->NewObject(cls, ctor,
             env2->NewStringUTF(s.domain),
             0LL, 0LL,
@@ -122,6 +123,13 @@ Java_com_netscope_sdk_NetScopeNative_nativeSetFlowEndCallback(JNIEnv* env, jobje
             static_cast<jlong>(s.last_active_ms));
         jclass fn_cls = env2->GetObjectClass(g_callback_obj);
         jmethodID invoke = env2->GetMethodID(fn_cls, "invoke", "(Ljava/lang/Object;)Ljava/lang/Object;");
+        if (!invoke) {
+            env2->DeleteLocalRef(obj);
+            env2->DeleteLocalRef(cls);
+            env2->DeleteLocalRef(fn_cls);
+            g_jvm->DetachCurrentThread();
+            return;
+        }
         env2->CallObjectMethod(g_callback_obj, invoke, obj);
         env2->DeleteLocalRef(obj);
         env2->DeleteLocalRef(cls);
