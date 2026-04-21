@@ -39,8 +39,10 @@ Java_com_netscope_sdk_NetScopeNative_testParseHttpHost(JNIEnv* env, jobject, jby
 extern "C" JNIEXPORT void JNICALL
 Java_com_netscope_sdk_NetScopeNative_testDnsCacheStore(JNIEnv* env, jobject,
                                                         jstring ip, jstring domain) {
-    const char* ip_c  = env->GetStringUTFChars(ip, nullptr);
+    const char* ip_c = env->GetStringUTFChars(ip, nullptr);
+    if (!ip_c) return;
     const char* dom_c = env->GetStringUTFChars(domain, nullptr);
+    if (!dom_c) { env->ReleaseStringUTFChars(ip, ip_c); return; }
     netscope::DnsCache::instance().store(ip_c, dom_c);
     env->ReleaseStringUTFChars(ip, ip_c);
     env->ReleaseStringUTFChars(domain, dom_c);
@@ -49,6 +51,7 @@ Java_com_netscope_sdk_NetScopeNative_testDnsCacheStore(JNIEnv* env, jobject,
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_netscope_sdk_NetScopeNative_testDnsCacheLookup(JNIEnv* env, jobject, jstring ip) {
     const char* ip_c = env->GetStringUTFChars(ip, nullptr);
+    if (!ip_c) return nullptr;
     std::string result = netscope::DnsCache::instance().lookup(ip_c);
     env->ReleaseStringUTFChars(ip, ip_c);
     return result.empty() ? nullptr : env->NewStringUTF(result.c_str());

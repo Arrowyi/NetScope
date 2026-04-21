@@ -20,11 +20,19 @@ void DnsCache::store(const std::string& ip, const std::string& hostname) {
 }
 
 std::string DnsCache::lookup(const std::string& ip) {
-    std::shared_lock lock(mutex_);
+    {
+        std::shared_lock lock(mutex_);
+        auto it = cache_.find(ip);
+        if (it == cache_.end()) return {};
+        if (it->second.expire_ms >= now_ms()) return it->second.hostname;
+    }
+    // Entry found but expired — evict it
+    std::unique_lock lock(mutex_);
     auto it = cache_.find(ip);
-    if (it == cache_.end()) return {};
-    if (it->second.expire_ms < now_ms()) return {};
-    return it->second.hostname;
+    if (it != cache_.end() && it->second.expire_ms < now_ms()) {
+        cache_.erase(it);
+    }
+    return {};
 }
 
 void DnsCache::clear() {
