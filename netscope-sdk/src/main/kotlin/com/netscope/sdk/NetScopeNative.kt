@@ -8,4 +8,6 @@ internal object NetScopeNative {
     // Test helpers
     external fun testParseSni(buf: ByteArray): String?
     external fun testParseHttpHost(buf: ByteArray): String?
+    external fun testDnsCacheStore(ip: String, domain: String)
+    external fun testDnsCacheLookup(ip: String): String?
 }

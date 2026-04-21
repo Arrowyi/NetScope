@@ -66,4 +66,28 @@ class NetScopeInstrumentedTest {
         val host = NetScopeNative.testParseHttpHost(data)
         assertEquals("api.example.com", host)
     }
+
+    @Test
+    fun testDnsCacheStoreAndLookup() {
+        System.loadLibrary("netscope")
+        NetScopeNative.testDnsCacheStore("192.168.1.1", "api.example.com")
+        val domain = NetScopeNative.testDnsCacheLookup("192.168.1.1")
+        assertEquals("api.example.com", domain)
+    }
+
+    @Test
+    fun testDnsCacheMiss() {
+        System.loadLibrary("netscope")
+        val domain = NetScopeNative.testDnsCacheLookup("10.0.0.99")
+        assertNull(domain)
+    }
+
+    @Test
+    fun testDnsCacheMultipleIps() {
+        System.loadLibrary("netscope")
+        NetScopeNative.testDnsCacheStore("1.1.1.1", "cdn.example.com")
+        NetScopeNative.testDnsCacheStore("1.1.1.2", "cdn.example.com")
+        assertEquals("cdn.example.com", NetScopeNative.testDnsCacheLookup("1.1.1.1"))
+        assertEquals("cdn.example.com", NetScopeNative.testDnsCacheLookup("1.1.1.2"))
+    }
 }
