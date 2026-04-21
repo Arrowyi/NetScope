@@ -4,16 +4,130 @@
 #include "core/dns_cache.h"
 #include "core/flow_table.h"
 #include "core/stats_aggregator.h"
+#include "hook/hook_manager.h"
 
 #define LOG_TAG "NetScope"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// ── Production stubs (will be replaced in Task 8) ────────────────────────────
+// Helper: convert DomainStatsC vector to Java DomainStats[]
+// DomainStats constructor: (String domain, long txTotal, long rxTotal,
+//                           long txInterval, long rxInterval,
+//                           int connTotal, int connInterval, long lastActiveMs)
+static jobjectArray make_stats_array(JNIEnv* env, const std::vector<netscope::DomainStatsC>& vec) {
+    jclass cls = env->FindClass("com/netscope/sdk/DomainStats");
+    if (!cls) return env->NewObjectArray(0, env->FindClass("java/lang/Object"), nullptr);
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "(Ljava/lang/String;JJJJIIJ)V");
+    jobjectArray arr = env->NewObjectArray(static_cast<jsize>(vec.size()), cls, nullptr);
+    for (size_t i = 0; i < vec.size(); ++i) {
+        const auto& s = vec[i];
+        jobject obj = env->NewObject(cls, ctor,
+            env->NewStringUTF(s.domain),
+            static_cast<jlong>(s.tx_total),
+            static_cast<jlong>(s.rx_total),
+            static_cast<jlong>(s.tx_curr),
+            static_cast<jlong>(s.rx_curr),
+            static_cast<jint>(s.count_total),
+            static_cast<jint>(s.count_curr),
+            static_cast<jlong>(s.last_active_ms));
+        env->SetObjectArrayElement(arr, static_cast<jsize>(i), obj);
+        env->DeleteLocalRef(obj);
+    }
+    return arr;
+}
+
+// For interval stats, the data comes from getIntervalStats() which populates tx_snap/rx_snap
+static jobjectArray make_interval_array(JNIEnv* env, const std::vector<netscope::DomainStatsC>& vec) {
+    jclass cls = env->FindClass("com/netscope/sdk/DomainStats");
+    if (!cls) return env->NewObjectArray(0, env->FindClass("java/lang/Object"), nullptr);
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "(Ljava/lang/String;JJJJIIJ)V");
+    jobjectArray arr = env->NewObjectArray(static_cast<jsize>(vec.size()), cls, nullptr);
+    for (size_t i = 0; i < vec.size(); ++i) {
+        const auto& s = vec[i];
+        jobject obj = env->NewObject(cls, ctor,
+            env->NewStringUTF(s.domain),
+            0LL, 0LL,
+            static_cast<jlong>(s.tx_snap),
+            static_cast<jlong>(s.rx_snap),
+            0,
+            static_cast<jint>(s.count_snap),
+            0LL);
+        env->SetObjectArrayElement(arr, static_cast<jsize>(i), obj);
+        env->DeleteLocalRef(obj);
+    }
+    return arr;
+}
+
+// Global JVM reference for callback thread attachment
+static JavaVM* g_jvm = nullptr;
+static jobject g_callback_obj = nullptr;  // GlobalRef to Kotlin lambda
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    g_jvm = vm;
+    return JNI_VERSION_1_6;
+}
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_netscope_sdk_NetScopeNative_nativeInit(JNIEnv*, jobject) {
-    LOGI("nativeInit stub");
-    return 0;
+    return netscope::hook_manager_init();
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_netscope_sdk_NetScopeNative_nativeDestroy(JNIEnv*, jobject) {
+    netscope::hook_manager_destroy();
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_netscope_sdk_NetScopeNative_nativePause(JNIEnv*, jobject) {
+    netscope::hook_manager_set_paused(true);
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_netscope_sdk_NetScopeNative_nativeResume(JNIEnv*, jobject) {
+    netscope::hook_manager_set_paused(false);
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_netscope_sdk_NetScopeNative_nativeClearStats(JNIEnv*, jobject) {
+    netscope::StatsAggregator::instance().clear();
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_netscope_sdk_NetScopeNative_nativeMarkIntervalBoundary(JNIEnv*, jobject) {
+    netscope::StatsAggregator::instance().markIntervalBoundary();
+}
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_netscope_sdk_NetScopeNative_nativeGetDomainStats(JNIEnv* env, jobject) {
+    return make_stats_array(env, netscope::StatsAggregator::instance().getDomainStats());
+}
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_netscope_sdk_NetScopeNative_nativeGetIntervalStats(JNIEnv* env, jobject) {
+    return make_interval_array(env, netscope::StatsAggregator::instance().getIntervalStats());
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_netscope_sdk_NetScopeNative_nativeSetFlowEndCallback(JNIEnv* env, jobject,
+                                                               jobject callback) {
+    if (g_callback_obj) { env->DeleteGlobalRef(g_callback_obj); g_callback_obj = nullptr; }
+    if (!callback) {
+        netscope::StatsAggregator::instance().setFlowEndCallback(nullptr);
+        return;
+    }
+    g_callback_obj = env->NewGlobalRef(callback);
+    netscope::StatsAggregator::instance().setFlowEndCallback([](const netscope::DomainStatsC& s) {
+        JNIEnv* env2 = nullptr;
+        if (!g_jvm || g_jvm->AttachCurrentThread(&env2, nullptr) != JNI_OK) return;
+        jclass cls = env2->FindClass("com/netscope/sdk/DomainStats");
+        if (!cls) { g_jvm->DetachCurrentThread(); return; }
+        jmethodID ctor = env2->GetMethodID(cls, "<init>", "(Ljava/lang/String;JJJJIIJ)V");
+        jobject obj = env2->NewObject(cls, ctor,
+            env2->NewStringUTF(s.domain),
+            0LL, 0LL,
+            static_cast<jlong>(s.tx_curr),
+            static_cast<jlong>(s.rx_curr),
+            0, 1,
+            static_cast<jlong>(s.last_active_ms));
+        jclass fn_cls = env2->GetObjectClass(g_callback_obj);
+        jmethodID invoke = env2->GetMethodID(fn_cls, "invoke", "(Ljava/lang/Object;)Ljava/lang/Object;");
+        env2->CallObjectMethod(g_callback_obj, invoke, obj);
+        env2->DeleteLocalRef(obj);
+        env2->DeleteLocalRef(cls);
+        env2->DeleteLocalRef(fn_cls);
+        g_jvm->DetachCurrentThread();
+    });
 }
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
