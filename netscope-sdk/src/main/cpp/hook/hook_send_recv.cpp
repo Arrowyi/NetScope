@@ -76,7 +76,11 @@ static ssize_t hook_write(int fd, const void* buf, size_t len) {
 static ssize_t hook_writev(int fd, const struct iovec* iov, int iovcnt) {
     ssize_t ret = orig_writev(fd, iov, iovcnt);
     if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
-    if (ret > 0) FlowTable::instance().add_tx(fd, static_cast<uint64_t>(ret));
+    if (ret > 0) {
+        // SNI/Host extraction skipped for writev: iov is a scatter buffer,
+        // not a contiguous packet. Domain should be set via connect (DNS) or send/write.
+        FlowTable::instance().add_tx(fd, static_cast<uint64_t>(ret));
+    }
     return ret;
 }
 
@@ -124,14 +128,14 @@ void install_hook_send_recv() {
 }
 
 void uninstall_hook_send_recv() {
-    shadowhook_unhook(g_stub_send);     g_stub_send = nullptr;
-    shadowhook_unhook(g_stub_sendto);   g_stub_sendto = nullptr;
-    shadowhook_unhook(g_stub_write);    g_stub_write = nullptr;
-    shadowhook_unhook(g_stub_writev);   g_stub_writev = nullptr;
-    shadowhook_unhook(g_stub_recv);     g_stub_recv = nullptr;
-    shadowhook_unhook(g_stub_recvfrom); g_stub_recvfrom = nullptr;
-    shadowhook_unhook(g_stub_read);     g_stub_read = nullptr;
-    shadowhook_unhook(g_stub_readv);    g_stub_readv = nullptr;
+    if (g_stub_send)     { shadowhook_unhook(g_stub_send);     g_stub_send = nullptr; }
+    if (g_stub_sendto)   { shadowhook_unhook(g_stub_sendto);   g_stub_sendto = nullptr; }
+    if (g_stub_write)    { shadowhook_unhook(g_stub_write);    g_stub_write = nullptr; }
+    if (g_stub_writev)   { shadowhook_unhook(g_stub_writev);   g_stub_writev = nullptr; }
+    if (g_stub_recv)     { shadowhook_unhook(g_stub_recv);     g_stub_recv = nullptr; }
+    if (g_stub_recvfrom) { shadowhook_unhook(g_stub_recvfrom); g_stub_recvfrom = nullptr; }
+    if (g_stub_read)     { shadowhook_unhook(g_stub_read);     g_stub_read = nullptr; }
+    if (g_stub_readv)    { shadowhook_unhook(g_stub_readv);    g_stub_readv = nullptr; }
 }
 
 } // namespace netscope
