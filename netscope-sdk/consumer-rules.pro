@@ -1,0 +1,1 @@
+-keep class indi.arrowyi.netscope.sdk.** { *; }
