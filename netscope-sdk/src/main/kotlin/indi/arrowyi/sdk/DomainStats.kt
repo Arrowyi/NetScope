@@ -1,4 +1,4 @@
-package com.netscope.sdk
+package indi.arrowyi.sdk
 
 /**
  * Traffic statistics for a single domain.

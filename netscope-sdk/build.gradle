@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace 'com.netscope.sdk'
+    namespace 'indi.arrowyi.sdk'
     compileSdk 34
     ndkVersion "25.2.9519653"
 
@@ -65,7 +65,7 @@ dependencies {
 publishing {
     publications {
         release(MavenPublication) {
-            groupId    = 'com.netscope'
+            groupId    = 'indi.arrowyi'
             artifactId = 'netscope-sdk'
             version    = '1.0.0'
             afterEvaluate { from components.release }

@@ -1,7 +1,7 @@
-package com.netscope.sdk
+package indi.arrowyi.sdk
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import com.netscope.sdk.NetScope
+import indi.arrowyi.sdk.NetScope
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith

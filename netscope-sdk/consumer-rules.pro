@@ -1,1 +1,1 @@
--keep class com.netscope.sdk.** { *; }
+-keep class indi.arrowyi.sdk.** { *; }

@@ -1,4 +1,4 @@
-package com.netscope.sdk
+package indi.arrowyi.sdk
 
 import android.util.Log
 import java.text.SimpleDateFormat

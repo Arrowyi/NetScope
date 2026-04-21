@@ -4,10 +4,10 @@ plugins {
 }
 
 android {
-    namespace 'com.netscope.app'
+    namespace 'indi.arrowyi.netscope.app'
     compileSdk 34
     defaultConfig {
-        applicationId "com.netscope.app"
+        applicationId "indi.arrowyi.netscope.app"
         minSdk 29
         targetSdk 34
         versionCode 1

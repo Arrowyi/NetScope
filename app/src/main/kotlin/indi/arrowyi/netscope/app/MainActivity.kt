@@ -1,10 +1,10 @@
-package com.netscope.app
+package indi.arrowyi.netscope.app
 
 import android.os.Bundle
 import android.widget.Button
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import com.netscope.sdk.NetScope
+import indi.arrowyi.sdk.NetScope
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import okhttp3.Request

@@ -1,4 +1,4 @@
-package com.netscope.sdk
+package indi.arrowyi.sdk
 
 import android.content.Context
 import android.util.Log
