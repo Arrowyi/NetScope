@@ -9,6 +9,7 @@ add_library(netscope SHARED
     hook/hook_connect.cpp
     hook/hook_dns.cpp
     hook/hook_send_recv.cpp
+    hook/hook_conscrypt.cpp
     hook/hook_close.cpp
     core/dns_cache.cpp
     core/flow_table.cpp

@@ -2,6 +2,7 @@
 #include "hook_manager.h"
 #include "../core/flow_table.h"
 #include "../utils/tls_sni_parser.h"
+#include "../netscope_log.h"
 #include "shadowhook.h"
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -10,14 +11,14 @@
 
 namespace netscope {
 
-static void* g_stub_send = nullptr;
-static void* g_stub_sendto = nullptr;
-static void* g_stub_write = nullptr;
-static void* g_stub_writev = nullptr;
-static void* g_stub_recv = nullptr;
+static void* g_stub_send     = nullptr;
+static void* g_stub_sendto   = nullptr;
+static void* g_stub_write    = nullptr;
+static void* g_stub_writev   = nullptr;
+static void* g_stub_recv     = nullptr;
 static void* g_stub_recvfrom = nullptr;
-static void* g_stub_read = nullptr;
-static void* g_stub_readv = nullptr;
+static void* g_stub_read     = nullptr;
+static void* g_stub_readv    = nullptr;
 
 static ssize_t (*orig_send)(int, const void*, size_t, int) = nullptr;
 static ssize_t (*orig_sendto)(int, const void*, size_t, int, const struct sockaddr*, socklen_t) = nullptr;
@@ -35,10 +36,22 @@ static void try_resolve_domain(int fd, const void* buf, size_t len) {
     char domain[256] = {};
     if (netscope::parse_tls_sni(static_cast<const uint8_t*>(buf), len, domain, sizeof(domain))) {
         FlowTable::instance().set_domain(fd, domain, true);
+        LOGD("domain-resolve: fd=%d via SNI -> %s", fd, domain);
         return;
     }
     if (netscope::parse_http_host(static_cast<const uint8_t*>(buf), len, domain, sizeof(domain))) {
         FlowTable::instance().set_domain(fd, domain, false);
+        LOGD("domain-resolve: fd=%d via HTTP Host -> %s", fd, domain);
+        return;
+    }
+    // No SNI/Host; domain remains what was set from DNS cache at connect() time.
+    // Peek current domain for log only.
+    FlowEntry e{};
+    if (FlowTable::instance().get(fd, &e)) {
+        if (e.domain[0])
+            LOGD("domain-resolve: fd=%d no SNI/Host, using DNS cache -> %s", fd, e.domain);
+        else
+            LOGW("domain-resolve: fd=%d no SNI/Host and DNS cache miss, will use IP", fd);
     }
 }
 
@@ -125,6 +138,14 @@ void install_hook_send_recv() {
     HOOK(g_stub_recvfrom, "libc.so", "recvfrom", hook_recvfrom, &orig_recvfrom);
     HOOK(g_stub_read,     "libc.so", "read",     hook_read,     &orig_read);
     HOOK(g_stub_readv,    "libc.so", "readv",    hook_readv,    &orig_readv);
+
+    LOGI("hook_send_recv(libc): send=%p sendto=%p write=%p writev=%p "
+         "recv=%p recvfrom=%p read=%p readv=%p",
+         g_stub_send, g_stub_sendto, g_stub_write, g_stub_writev,
+         g_stub_recv, g_stub_recvfrom, g_stub_read, g_stub_readv);
+
+    if (!g_stub_send || !g_stub_write || !g_stub_recv || !g_stub_read)
+        LOGE("hook_send_recv: one or more critical libc.so hooks failed");
 }
 
 void uninstall_hook_send_recv() {
