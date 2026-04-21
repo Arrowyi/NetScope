@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include "utils/tls_sni_parser.h"
 #include "core/dns_cache.h"
+#include "core/flow_table.h"
 
 #define LOG_TAG "NetScope"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -55,4 +56,57 @@ Java_com_netscope_sdk_NetScopeNative_testDnsCacheLookup(JNIEnv* env, jobject, js
     std::string result = netscope::DnsCache::instance().lookup(ip_c);
     env->ReleaseStringUTFChars(ip, ip_c);
     return result.empty() ? nullptr : env->NewStringUTF(result.c_str());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_netscope_sdk_NetScopeNative_testFlowCreate(JNIEnv* env, jobject,
+        jint fd, jstring ip, jint port, jstring domain) {
+    const char* ip_c = env->GetStringUTFChars(ip, nullptr);
+    if (!ip_c) return;
+    const char* dom_c = env->GetStringUTFChars(domain, nullptr);
+    if (!dom_c) { env->ReleaseStringUTFChars(ip, ip_c); return; }
+    netscope::FlowTable::instance().create(fd, ip_c, static_cast<uint16_t>(port), dom_c);
+    env->ReleaseStringUTFChars(ip, ip_c);
+    env->ReleaseStringUTFChars(domain, dom_c);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_netscope_sdk_NetScopeNative_testFlowAddTx(JNIEnv*, jobject, jint fd, jlong bytes) {
+    netscope::FlowTable::instance().add_tx(fd, bytes);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_netscope_sdk_NetScopeNative_testFlowAddRx(JNIEnv*, jobject, jint fd, jlong bytes) {
+    netscope::FlowTable::instance().add_rx(fd, bytes);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_netscope_sdk_NetScopeNative_testFlowGetDomain(JNIEnv* env, jobject, jint fd) {
+    netscope::FlowEntry e{};
+    if (!netscope::FlowTable::instance().remove(fd, &e)) return nullptr;
+    // Restore entry after peek
+    netscope::FlowTable::instance().create(fd, e.remote_ip, e.remote_port, e.domain);
+    netscope::FlowTable::instance().add_tx(fd, e.tx_bytes);
+    netscope::FlowTable::instance().add_rx(fd, e.rx_bytes);
+    return env->NewStringUTF(e.domain);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_netscope_sdk_NetScopeNative_testFlowGetTx(JNIEnv*, jobject, jint fd) {
+    netscope::FlowEntry e{};
+    if (!netscope::FlowTable::instance().remove(fd, &e)) return -1;
+    netscope::FlowTable::instance().create(fd, e.remote_ip, e.remote_port, e.domain);
+    netscope::FlowTable::instance().add_tx(fd, e.tx_bytes);
+    netscope::FlowTable::instance().add_rx(fd, e.rx_bytes);
+    return static_cast<jlong>(e.tx_bytes);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_netscope_sdk_NetScopeNative_testFlowGetRx(JNIEnv*, jobject, jint fd) {
+    netscope::FlowEntry e{};
+    if (!netscope::FlowTable::instance().remove(fd, &e)) return -1;
+    netscope::FlowTable::instance().create(fd, e.remote_ip, e.remote_port, e.domain);
+    netscope::FlowTable::instance().add_tx(fd, e.tx_bytes);
+    netscope::FlowTable::instance().add_rx(fd, e.rx_bytes);
+    return static_cast<jlong>(e.rx_bytes);
 }

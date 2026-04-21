@@ -90,4 +90,27 @@ class NetScopeInstrumentedTest {
         assertEquals("cdn.example.com", NetScopeNative.testDnsCacheLookup("1.1.1.1"))
         assertEquals("cdn.example.com", NetScopeNative.testDnsCacheLookup("1.1.1.2"))
     }
+
+    @Test
+    fun testFlowTableCreateAndGetDomain() {
+        System.loadLibrary("netscope")
+        NetScopeNative.testFlowCreate(42, "93.184.216.34", 443, "example.com")
+        assertEquals("example.com", NetScopeNative.testFlowGetDomain(42))
+    }
+
+    @Test
+    fun testFlowTableAddBytes() {
+        System.loadLibrary("netscope")
+        NetScopeNative.testFlowCreate(43, "1.2.3.4", 443, "test.com")
+        NetScopeNative.testFlowAddTx(43, 1024)
+        NetScopeNative.testFlowAddRx(43, 2048)
+        assertEquals(1024L, NetScopeNative.testFlowGetTx(43))
+        assertEquals(2048L, NetScopeNative.testFlowGetRx(43))
+    }
+
+    @Test
+    fun testFlowTableMissingFd() {
+        System.loadLibrary("netscope")
+        assertNull(NetScopeNative.testFlowGetDomain(9999))
+    }
 }
