@@ -83,30 +83,20 @@ Java_com_netscope_sdk_NetScopeNative_testFlowAddRx(JNIEnv*, jobject, jint fd, jl
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_netscope_sdk_NetScopeNative_testFlowGetDomain(JNIEnv* env, jobject, jint fd) {
     netscope::FlowEntry e{};
-    if (!netscope::FlowTable::instance().remove(fd, &e)) return nullptr;
-    // Restore entry after peek
-    netscope::FlowTable::instance().create(fd, e.remote_ip, e.remote_port, e.domain);
-    netscope::FlowTable::instance().add_tx(fd, e.tx_bytes);
-    netscope::FlowTable::instance().add_rx(fd, e.rx_bytes);
+    if (!netscope::FlowTable::instance().get(fd, &e)) return nullptr;
     return env->NewStringUTF(e.domain);
 }
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_netscope_sdk_NetScopeNative_testFlowGetTx(JNIEnv*, jobject, jint fd) {
     netscope::FlowEntry e{};
-    if (!netscope::FlowTable::instance().remove(fd, &e)) return -1;
-    netscope::FlowTable::instance().create(fd, e.remote_ip, e.remote_port, e.domain);
-    netscope::FlowTable::instance().add_tx(fd, e.tx_bytes);
-    netscope::FlowTable::instance().add_rx(fd, e.rx_bytes);
+    if (!netscope::FlowTable::instance().get(fd, &e)) return -1;
     return static_cast<jlong>(e.tx_bytes);
 }
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_netscope_sdk_NetScopeNative_testFlowGetRx(JNIEnv*, jobject, jint fd) {
     netscope::FlowEntry e{};
-    if (!netscope::FlowTable::instance().remove(fd, &e)) return -1;
-    netscope::FlowTable::instance().create(fd, e.remote_ip, e.remote_port, e.domain);
-    netscope::FlowTable::instance().add_tx(fd, e.tx_bytes);
-    netscope::FlowTable::instance().add_rx(fd, e.rx_bytes);
+    if (!netscope::FlowTable::instance().get(fd, &e)) return -1;
     return static_cast<jlong>(e.rx_bytes);
 }

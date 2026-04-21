@@ -31,6 +31,8 @@ public:
     bool   is_first_send_done(int fd);
     // Remove and return entry (for flush on close)
     bool   remove(int fd, FlowEntry* out);
+    // Read-only peek (returns false if fd not found)
+    bool   get(int fd, FlowEntry* out);
 
 private:
     FlowTable() = default;

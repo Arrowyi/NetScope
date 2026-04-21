@@ -24,13 +24,13 @@ bool FlowTable::contains(int fd) {
 }
 
 void FlowTable::add_tx(int fd, uint64_t bytes) {
-    std::shared_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
     auto it = table_.find(fd);
     if (it != table_.end()) it->second.tx_bytes += bytes;
 }
 
 void FlowTable::add_rx(int fd, uint64_t bytes) {
-    std::shared_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
     auto it = table_.find(fd);
     if (it != table_.end()) it->second.rx_bytes += bytes;
 }
@@ -62,6 +62,14 @@ bool FlowTable::remove(int fd, FlowEntry* out) {
     if (it == table_.end()) return false;
     if (out) *out = it->second;
     table_.erase(it);
+    return true;
+}
+
+bool FlowTable::get(int fd, FlowEntry* out) {
+    std::shared_lock lock(mutex_);
+    auto it = table_.find(fd);
+    if (it == table_.end()) return false;
+    if (out) *out = it->second;
     return true;
 }
 
