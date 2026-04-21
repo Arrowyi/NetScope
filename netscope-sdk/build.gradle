@@ -42,6 +42,12 @@ android {
 
     buildFeatures { prefab true }
 
+    packagingOptions {
+        jniLibs {
+            pickFirsts += ['**/libshadowhook.so']
+        }
+    }
+
     publishing {
         singleVariant('release') { withSourcesJar() }
     }
@@ -51,6 +57,7 @@ dependencies {
     implementation 'com.bytedance.android:shadowhook:1.0.9'
     implementation 'androidx.annotation:annotation:1.7.1'
     testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test:runner:1.5.2'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'com.squareup.okhttp3:okhttp:4.12.0'
 }
