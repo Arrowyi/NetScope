@@ -2,7 +2,7 @@ package indi.arrowyi.netscope.app
 
 import android.app.Application
 import android.util.Log
-import indi.arrowyi.sdk.NetScope
+import indi.arrowyi.netscope.sdk.NetScope
 
 class SampleApplication : Application() {
     override fun onCreate() {

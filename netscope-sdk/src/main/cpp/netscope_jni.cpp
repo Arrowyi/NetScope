@@ -14,7 +14,7 @@
 //                           long txInterval, long rxInterval,
 //                           int connTotal, int connInterval, long lastActiveMs)
 static jobjectArray make_stats_array(JNIEnv* env, const std::vector<netscope::DomainStatsC>& vec) {
-    jclass cls = env->FindClass("indi/arrowyi/sdk/DomainStats");
+    jclass cls = env->FindClass("indi/arrowyi/netscope/sdk/DomainStats");
     if (!cls) return env->NewObjectArray(0, env->FindClass("java/lang/Object"), nullptr);
     jmethodID ctor = env->GetMethodID(cls, "<init>", "(Ljava/lang/String;JJJJIIJ)V");
     jobjectArray arr = env->NewObjectArray(static_cast<jsize>(vec.size()), cls, nullptr);
@@ -37,7 +37,7 @@ static jobjectArray make_stats_array(JNIEnv* env, const std::vector<netscope::Do
 
 // For interval stats, the data comes from getIntervalStats() which populates tx_snap/rx_snap
 static jobjectArray make_interval_array(JNIEnv* env, const std::vector<netscope::DomainStatsC>& vec) {
-    jclass cls = env->FindClass("indi/arrowyi/sdk/DomainStats");
+    jclass cls = env->FindClass("indi/arrowyi/netscope/sdk/DomainStats");
     if (!cls) return env->NewObjectArray(0, env->FindClass("java/lang/Object"), nullptr);
     jmethodID ctor = env->GetMethodID(cls, "<init>", "(Ljava/lang/String;JJJJIIJ)V");
     jobjectArray arr = env->NewObjectArray(static_cast<jsize>(vec.size()), cls, nullptr);
@@ -67,39 +67,39 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_nativeInit(JNIEnv*, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeInit(JNIEnv*, jobject) {
     return netscope::hook_manager_init();
 }
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_nativeDestroy(JNIEnv*, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeDestroy(JNIEnv*, jobject) {
     netscope::hook_manager_destroy();
 }
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_nativePause(JNIEnv*, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativePause(JNIEnv*, jobject) {
     netscope::hook_manager_set_paused(true);
 }
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_nativeResume(JNIEnv*, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeResume(JNIEnv*, jobject) {
     netscope::hook_manager_set_paused(false);
 }
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_nativeClearStats(JNIEnv*, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeClearStats(JNIEnv*, jobject) {
     netscope::StatsAggregator::instance().clear();
 }
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_nativeMarkIntervalBoundary(JNIEnv*, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeMarkIntervalBoundary(JNIEnv*, jobject) {
     netscope::StatsAggregator::instance().markIntervalBoundary();
 }
 extern "C" JNIEXPORT jobjectArray JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_nativeGetDomainStats(JNIEnv* env, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeGetDomainStats(JNIEnv* env, jobject) {
     return make_stats_array(env, netscope::StatsAggregator::instance().getDomainStats());
 }
 extern "C" JNIEXPORT jobjectArray JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_nativeGetIntervalStats(JNIEnv* env, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeGetIntervalStats(JNIEnv* env, jobject) {
     return make_interval_array(env, netscope::StatsAggregator::instance().getIntervalStats());
 }
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_nativeSetFlowEndCallback(JNIEnv* env, jobject,
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeSetFlowEndCallback(JNIEnv* env, jobject,
                                                                jobject callback) {
     if (g_callback_obj) { env->DeleteGlobalRef(g_callback_obj); g_callback_obj = nullptr; }
     if (!callback) {
@@ -110,7 +110,7 @@ Java_indi_arrowyi_sdk_NetScopeNative_nativeSetFlowEndCallback(JNIEnv* env, jobje
     netscope::StatsAggregator::instance().setFlowEndCallback([](const netscope::DomainStatsC& s) {
         JNIEnv* env2 = nullptr;
         if (!g_jvm || g_jvm->AttachCurrentThread(&env2, nullptr) != JNI_OK) return;
-        jclass cls = env2->FindClass("indi/arrowyi/sdk/DomainStats");
+        jclass cls = env2->FindClass("indi/arrowyi/netscope/sdk/DomainStats");
         if (!cls) { g_jvm->DetachCurrentThread(); return; }
         jmethodID ctor = env2->GetMethodID(cls, "<init>", "(Ljava/lang/String;JJJJIIJ)V");
         if (!ctor) { env2->DeleteLocalRef(cls); g_jvm->DetachCurrentThread(); return; }
@@ -141,7 +141,7 @@ Java_indi_arrowyi_sdk_NetScopeNative_nativeSetFlowEndCallback(JNIEnv* env, jobje
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testParseSni(JNIEnv* env, jobject, jbyteArray buf) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testParseSni(JNIEnv* env, jobject, jbyteArray buf) {
     jsize len   = env->GetArrayLength(buf);
     jbyte* data = env->GetByteArrayElements(buf, nullptr);
     char sni[256] = {};
@@ -151,7 +151,7 @@ Java_indi_arrowyi_sdk_NetScopeNative_testParseSni(JNIEnv* env, jobject, jbyteArr
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testParseHttpHost(JNIEnv* env, jobject, jbyteArray buf) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testParseHttpHost(JNIEnv* env, jobject, jbyteArray buf) {
     jsize len   = env->GetArrayLength(buf);
     jbyte* data = env->GetByteArrayElements(buf, nullptr);
     char host[256] = {};
@@ -161,7 +161,7 @@ Java_indi_arrowyi_sdk_NetScopeNative_testParseHttpHost(JNIEnv* env, jobject, jby
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testDnsCacheStore(JNIEnv* env, jobject,
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testDnsCacheStore(JNIEnv* env, jobject,
                                                         jstring ip, jstring domain) {
     const char* ip_c = env->GetStringUTFChars(ip, nullptr);
     if (!ip_c) return;
@@ -173,7 +173,7 @@ Java_indi_arrowyi_sdk_NetScopeNative_testDnsCacheStore(JNIEnv* env, jobject,
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testDnsCacheLookup(JNIEnv* env, jobject, jstring ip) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testDnsCacheLookup(JNIEnv* env, jobject, jstring ip) {
     const char* ip_c = env->GetStringUTFChars(ip, nullptr);
     if (!ip_c) return nullptr;
     std::string result = netscope::DnsCache::instance().lookup(ip_c);
@@ -182,7 +182,7 @@ Java_indi_arrowyi_sdk_NetScopeNative_testDnsCacheLookup(JNIEnv* env, jobject, js
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testFlowCreate(JNIEnv* env, jobject,
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testFlowCreate(JNIEnv* env, jobject,
         jint fd, jstring ip, jint port, jstring domain) {
     const char* ip_c = env->GetStringUTFChars(ip, nullptr);
     if (!ip_c) return;
@@ -194,43 +194,43 @@ Java_indi_arrowyi_sdk_NetScopeNative_testFlowCreate(JNIEnv* env, jobject,
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testFlowAddTx(JNIEnv*, jobject, jint fd, jlong bytes) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testFlowAddTx(JNIEnv*, jobject, jint fd, jlong bytes) {
     netscope::FlowTable::instance().add_tx(fd, bytes);
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testFlowAddRx(JNIEnv*, jobject, jint fd, jlong bytes) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testFlowAddRx(JNIEnv*, jobject, jint fd, jlong bytes) {
     netscope::FlowTable::instance().add_rx(fd, bytes);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testFlowGetDomain(JNIEnv* env, jobject, jint fd) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testFlowGetDomain(JNIEnv* env, jobject, jint fd) {
     netscope::FlowEntry e{};
     if (!netscope::FlowTable::instance().get(fd, &e)) return nullptr;
     return env->NewStringUTF(e.domain);
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testFlowGetTx(JNIEnv*, jobject, jint fd) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testFlowGetTx(JNIEnv*, jobject, jint fd) {
     netscope::FlowEntry e{};
     if (!netscope::FlowTable::instance().get(fd, &e)) return -1;
     return static_cast<jlong>(e.tx_bytes);
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testFlowGetRx(JNIEnv*, jobject, jint fd) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testFlowGetRx(JNIEnv*, jobject, jint fd) {
     netscope::FlowEntry e{};
     if (!netscope::FlowTable::instance().get(fd, &e)) return -1;
     return static_cast<jlong>(e.rx_bytes);
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testStatsClear(JNIEnv*, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testStatsClear(JNIEnv*, jobject) {
     netscope::StatsAggregator::instance().clear();
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testStatsFlush(JNIEnv* env, jobject,
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testStatsFlush(JNIEnv* env, jobject,
                                                      jstring domain, jlong tx, jlong rx) {
     const char* d = env->GetStringUTFChars(domain, nullptr);
     if (!d) return;
@@ -239,12 +239,12 @@ Java_indi_arrowyi_sdk_NetScopeNative_testStatsFlush(JNIEnv* env, jobject,
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testStatsMark(JNIEnv*, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testStatsMark(JNIEnv*, jobject) {
     netscope::StatsAggregator::instance().markIntervalBoundary();
 }
 
 extern "C" JNIEXPORT jobjectArray JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testStatsGetCumulative(JNIEnv* env, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testStatsGetCumulative(JNIEnv* env, jobject) {
     auto stats = netscope::StatsAggregator::instance().getDomainStats();
     jclass strCls = env->FindClass("java/lang/String");
     jobjectArray arr = env->NewObjectArray(static_cast<jsize>(stats.size()), strCls, nullptr);
@@ -260,7 +260,7 @@ Java_indi_arrowyi_sdk_NetScopeNative_testStatsGetCumulative(JNIEnv* env, jobject
 }
 
 extern "C" JNIEXPORT jobjectArray JNICALL
-Java_indi_arrowyi_sdk_NetScopeNative_testStatsGetInterval(JNIEnv* env, jobject) {
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_testStatsGetInterval(JNIEnv* env, jobject) {
     auto stats = netscope::StatsAggregator::instance().getIntervalStats();
     jclass strCls = env->FindClass("java/lang/String");
     jobjectArray arr = env->NewObjectArray(static_cast<jsize>(stats.size()), strCls, nullptr);

@@ -1,4 +1,4 @@
-package indi.arrowyi.sdk
+package indi.arrowyi.netscope.sdk
 
 internal object NetScopeNative {
     init { System.loadLibrary("netscope") }
