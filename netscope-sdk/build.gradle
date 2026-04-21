@@ -48,7 +48,7 @@ android {
 }
 
 dependencies {
-    implementation 'com.bytedance.android.byteHook:shadowhook:1.0.9'
+    implementation 'com.bytedance.android:shadowhook:1.0.9'
     implementation 'androidx.annotation:annotation:1.7.1'
     testImplementation 'junit:junit:4.13.2'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
