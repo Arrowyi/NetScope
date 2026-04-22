@@ -37,7 +37,13 @@ static int hook_getaddrinfo(const char* node, const char* service,
 }
 
 void install_hook_dns() {
-    xhook_register(".*\\.so$", "getaddrinfo", (void*)hook_getaddrinfo, (void**)&orig_getaddrinfo);
+    int ret = xhook_register(".*\\.so$", "getaddrinfo", (void*)hook_getaddrinfo, (void**)&orig_getaddrinfo);
+    if (ret != 0) LOGE("hook_dns: xhook_register failed ret=%d", ret);
+}
+
+void verify_hook_dns() {
+    if (orig_getaddrinfo) LOGI("hook_dns: active orig=%p", (void*)orig_getaddrinfo);
+    else                  LOGE("hook_dns: orig_getaddrinfo null — DNS not hooked");
 }
 
 void uninstall_hook_dns() {}

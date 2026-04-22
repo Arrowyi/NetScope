@@ -29,9 +29,15 @@ static int hook_connect(int sockfd, const struct sockaddr* addr, socklen_t addrl
 }
 
 void install_hook_connect() {
-    xhook_register(".*\\.so$", "connect", (void*)hook_connect, (void**)&orig_connect);
+    int ret = xhook_register(".*\\.so$", "connect", (void*)hook_connect, (void**)&orig_connect);
+    if (ret != 0) LOGE("hook_connect: xhook_register failed ret=%d", ret);
 }
 
-void uninstall_hook_connect() {}  // teardown handled centrally by xhook_clear in hook_manager_destroy
+void verify_hook_connect() {
+    if (orig_connect) LOGI("hook_connect: active orig=%p", (void*)orig_connect);
+    else              LOGE("hook_connect: orig_connect null — connect() not hooked");
+}
+
+void uninstall_hook_connect() {}
 
 } // namespace netscope

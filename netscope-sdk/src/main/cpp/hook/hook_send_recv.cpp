@@ -138,16 +138,32 @@ static ssize_t hook_readv(int fd, const struct iovec* iov, int iovcnt) {
 }
 
 void install_hook_send_recv() {
-    xhook_register(".*\\.so$", "send",     (void*)hook_send,     (void**)&orig_send);
-    xhook_register(".*\\.so$", "sendto",   (void*)hook_sendto,   (void**)&orig_sendto);
-    xhook_register(".*\\.so$", "write",    (void*)hook_write,    (void**)&orig_write);
-    xhook_register(".*\\.so$", "writev",   (void*)hook_writev,   (void**)&orig_writev);
-    xhook_register(".*\\.so$", "recv",     (void*)hook_recv,     (void**)&orig_recv);
-    xhook_register(".*\\.so$", "recvfrom", (void*)hook_recvfrom, (void**)&orig_recvfrom);
-    xhook_register(".*\\.so$", "read",     (void*)hook_read,     (void**)&orig_read);
-    xhook_register(".*\\.so$", "readv",    (void*)hook_readv,    (void**)&orig_readv);
+#define REG(sym, fn, orig) \
+    do { if (xhook_register(".*\\.so$", sym, (void*)(fn), (void**)(orig)) != 0) \
+             LOGE("hook_send_recv: register '%s' failed", sym); } while(0)
+
+    REG("send",     hook_send,     &orig_send);
+    REG("sendto",   hook_sendto,   &orig_sendto);
+    REG("write",    hook_write,    &orig_write);
+    REG("writev",   hook_writev,   &orig_writev);
+    REG("recv",     hook_recv,     &orig_recv);
+    REG("recvfrom", hook_recvfrom, &orig_recvfrom);
+    REG("read",     hook_read,     &orig_read);
+    REG("readv",    hook_readv,    &orig_readv);
+#undef REG
 }
 
-void uninstall_hook_send_recv() {}  // teardown handled centrally by xhook_clear in hook_manager_destroy
+void verify_hook_send_recv() {
+    LOGI("hook_send_recv: send=%p sendto=%p write=%p writev=%p "
+         "recv=%p recvfrom=%p read=%p readv=%p",
+         (void*)orig_send,  (void*)orig_sendto,
+         (void*)orig_write, (void*)orig_writev,
+         (void*)orig_recv,  (void*)orig_recvfrom,
+         (void*)orig_read,  (void*)orig_readv);
+    if (!orig_send || !orig_write || !orig_recv || !orig_read)
+        LOGE("hook_send_recv: one or more critical hooks not applied");
+}
+
+void uninstall_hook_send_recv() {}
 
 } // namespace netscope

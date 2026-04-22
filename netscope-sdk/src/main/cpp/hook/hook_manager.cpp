@@ -70,9 +70,17 @@ int hook_manager_init() {
     // patches their GOT entries. No mmap(PROT_EXEC) — xhook only uses mprotect
     // on the existing (already-executable) GOT data pages.
     int ret = xhook_refresh(0);
-    if (ret != 0) LOGE("hook_manager_init: xhook_refresh failed ret=%d", ret);
-    else          LOGI("hook_manager_init: all hooks installed");
-    return ret;
+    if (ret != 0) {
+        LOGE("hook_manager_init: xhook_refresh failed ret=%d", ret);
+        return ret;
+    }
+    LOGI("hook_manager_init: xhook_refresh done, verifying hooks");
+    verify_hook_connect();
+    verify_hook_dns();
+    verify_hook_send_recv();
+    verify_hook_close();
+    LOGI("hook_manager_init: all hooks installed");
+    return 0;
 }
 
 void hook_manager_destroy() {

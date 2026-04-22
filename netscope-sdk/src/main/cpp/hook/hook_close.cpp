@@ -28,7 +28,13 @@ static int hook_close(int fd) {
 }
 
 void install_hook_close() {
-    xhook_register(".*\\.so$", "close", (void*)hook_close, (void**)&orig_close);
+    int ret = xhook_register(".*\\.so$", "close", (void*)hook_close, (void**)&orig_close);
+    if (ret != 0) LOGE("hook_close: xhook_register failed ret=%d", ret);
+}
+
+void verify_hook_close() {
+    if (orig_close) LOGI("hook_close: active orig=%p", (void*)orig_close);
+    else            LOGE("hook_close: orig_close null — close() not hooked");
 }
 
 void uninstall_hook_close() {}
