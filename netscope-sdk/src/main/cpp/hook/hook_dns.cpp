@@ -15,6 +15,7 @@ static int (*orig_getaddrinfo)(const char*, const char*, const struct addrinfo*,
 
 static int hook_getaddrinfo(const char* node, const char* service,
                              const struct addrinfo* hints, struct addrinfo** res) {
+    SHADOWHOOK_STACK_SCOPE();
     int ret = orig_getaddrinfo(node, service, hints, res);
     if (hook_manager_is_paused() || ret != 0 || !node || !res || !*res) return ret;
 

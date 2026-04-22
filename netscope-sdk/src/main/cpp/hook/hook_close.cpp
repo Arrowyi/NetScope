@@ -13,6 +13,7 @@ static void* g_stub = nullptr;
 static int (*orig_close)(int) = nullptr;
 
 static int hook_close(int fd) {
+    SHADOWHOOK_STACK_SCOPE();
     if (!hook_manager_is_paused() && FlowTable::instance().contains(fd)) {
         FlowEntry e{};
         if (FlowTable::instance().remove(fd, &e)) {

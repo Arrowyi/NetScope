@@ -55,6 +55,7 @@ static inline void count_rx(int fd, ssize_t ret) {
 }
 
 static ssize_t hook_send(int fd, const void* buf, size_t len, int flags) {
+    SHADOWHOOK_STACK_SCOPE();
     ssize_t ret = orig_send(fd, buf, len, flags);
     count_tx(fd, ret);
     return ret;
@@ -62,24 +63,28 @@ static ssize_t hook_send(int fd, const void* buf, size_t len, int flags) {
 
 static ssize_t hook_sendto(int fd, const void* buf, size_t len, int flags,
                             const struct sockaddr* dest, socklen_t dest_len) {
+    SHADOWHOOK_STACK_SCOPE();
     ssize_t ret = orig_sendto(fd, buf, len, flags, dest, dest_len);
     count_tx(fd, ret);
     return ret;
 }
 
 static ssize_t hook_write(int fd, const void* buf, size_t len) {
+    SHADOWHOOK_STACK_SCOPE();
     ssize_t ret = orig_write(fd, buf, len);
     count_tx(fd, ret);
     return ret;
 }
 
 static ssize_t hook_writev(int fd, const struct iovec* iov, int iovcnt) {
+    SHADOWHOOK_STACK_SCOPE();
     ssize_t ret = orig_writev(fd, iov, iovcnt);
     count_tx(fd, ret);
     return ret;
 }
 
 static ssize_t hook_recv(int fd, void* buf, size_t len, int flags) {
+    SHADOWHOOK_STACK_SCOPE();
     ssize_t ret = orig_recv(fd, buf, len, flags);
     count_rx(fd, ret);
     return ret;
@@ -87,18 +92,21 @@ static ssize_t hook_recv(int fd, void* buf, size_t len, int flags) {
 
 static ssize_t hook_recvfrom(int fd, void* buf, size_t len, int flags,
                               struct sockaddr* src, socklen_t* src_len) {
+    SHADOWHOOK_STACK_SCOPE();
     ssize_t ret = orig_recvfrom(fd, buf, len, flags, src, src_len);
     count_rx(fd, ret);
     return ret;
 }
 
 static ssize_t hook_read(int fd, void* buf, size_t len) {
+    SHADOWHOOK_STACK_SCOPE();
     ssize_t ret = orig_read(fd, buf, len);
     count_rx(fd, ret);
     return ret;
 }
 
 static ssize_t hook_readv(int fd, const struct iovec* iov, int iovcnt) {
+    SHADOWHOOK_STACK_SCOPE();
     ssize_t ret = orig_readv(fd, iov, iovcnt);
     count_rx(fd, ret);
     return ret;
