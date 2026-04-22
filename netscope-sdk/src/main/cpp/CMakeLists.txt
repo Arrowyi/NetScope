@@ -1,10 +1,12 @@
 cmake_minimum_required(VERSION 3.22.1)
 project("netscope")
 
-add_library(bytehook SHARED IMPORTED)
-set_target_properties(bytehook PROPERTIES
-    IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/bytehook/libs/${ANDROID_ABI}/libbytehook.so
-    INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/bytehook/include
+# xhook: pure GOT/PLT patcher, no mmap(PROT_EXEC), no trampolines.
+# Links statically into libnetscope.so — no extra .so shipped to consumers.
+add_library(xhook STATIC IMPORTED)
+set_target_properties(xhook PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xhook/libs/${ANDROID_ABI}/libxhook.a
+    INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xhook/include
 )
 
 add_library(netscope SHARED
@@ -24,7 +26,7 @@ add_library(netscope SHARED
 target_include_directories(netscope PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(netscope
-    bytehook
+    xhook
     log
     android
 )

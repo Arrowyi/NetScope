@@ -3,16 +3,15 @@
 #include "../core/flow_table.h"
 #include "../core/stats_aggregator.h"
 #include "../netscope_log.h"
-#include "bytehook.h"
+#include "xhook.h"
 #include <unistd.h>
 #include <cstring>
 
 namespace netscope {
 
-static bytehook_stub_t g_stub = nullptr;
+static int (*orig_close)(int) = nullptr;
 
 static int hook_close(int fd) {
-    BYTEHOOK_STACK_SCOPE();
     if (!hook_manager_is_paused() && FlowTable::instance().contains(fd)) {
         FlowEntry e{};
         if (FlowTable::instance().remove(fd, &e)) {
@@ -25,17 +24,13 @@ static int hook_close(int fd) {
             StatsAggregator::instance().invokeFlowEndCallback(domain, e.tx_bytes, e.rx_bytes);
         }
     }
-    return BYTEHOOK_CALL_PREV(hook_close, fd);
+    return orig_close ? orig_close(fd) : close(fd);
 }
 
 void install_hook_close() {
-    g_stub = bytehook_hook_all(nullptr, "close", (void*)hook_close, nullptr, nullptr);
-    if (g_stub) LOGI("hook_close: installed");
-    else        LOGE("hook_close: install failed");
+    xhook_register(".*\\.so$", "close", (void*)hook_close, (void**)&orig_close);
 }
 
-void uninstall_hook_close() {
-    if (g_stub) { bytehook_unhook(g_stub); g_stub = nullptr; }
-}
+void uninstall_hook_close() {}
 
 } // namespace netscope

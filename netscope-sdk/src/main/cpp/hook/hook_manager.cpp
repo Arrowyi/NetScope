@@ -4,7 +4,7 @@
 #include "hook_send_recv.h"
 #include "hook_close.h"
 #include "../netscope_log.h"
-#include "bytehook.h"
+#include "xhook.h"
 #include <atomic>
 
 namespace netscope {
@@ -12,26 +12,27 @@ namespace netscope {
 static std::atomic<bool> g_paused{false};
 
 int hook_manager_init() {
-    int ret = bytehook_init(BYTEHOOK_MODE_AUTOMATIC, false);
-    if (ret != 0) {
-        LOGE("hook_manager_init: bytehook_init failed ret=%d", ret);
-        return ret;
-    }
-    LOGI("hook_manager_init: bytehook ready, installing hooks");
+    // Prevent patching our own PLT to avoid any re-entrant surprise.
+    xhook_ignore("libnetscope\\.so$", nullptr);
+
+    // Register all hook patterns (no-op until xhook_refresh).
     install_hook_connect();
     install_hook_dns();
     install_hook_send_recv();
     install_hook_close();
-    LOGI("hook_manager_init: all hooks installed");
-    return 0;
+
+    // Single refresh scans all currently-loaded libraries and patches GOT entries.
+    // No mmap(PROT_EXEC) involved — xhook only uses mprotect on existing GOT pages.
+    int ret = xhook_refresh(0);
+    if (ret != 0) LOGE("hook_manager_init: xhook_refresh failed ret=%d", ret);
+    else          LOGI("hook_manager_init: all hooks installed");
+    return ret;
 }
 
 void hook_manager_destroy() {
-    LOGI("hook_manager_destroy: uninstalling hooks");
-    uninstall_hook_connect();
-    uninstall_hook_dns();
-    uninstall_hook_send_recv();
-    uninstall_hook_close();
+    LOGI("hook_manager_destroy: clearing hooks");
+    xhook_clear();
+    xhook_refresh(0);
     LOGI("hook_manager_destroy: done");
 }
 
