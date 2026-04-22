@@ -1,9 +1,27 @@
+// Hooks send/recv/write/read/writev/readv/sendto/recvfrom in ALL loaded libraries via PLT.
+//
+// WHY bytehook_hook_all:
+//   bytehook_hook_all(NULL, sym, ...) patches the GOT/PLT entry for sym in every
+//   loaded .so, including libconscrypt_jni.so (Java HTTPS) and any NDK native library.
+//   New libraries loaded after init (dlopen) are automatically covered as well.
+//   This replaces the previous two-file approach (hook_send_recv + hook_conscrypt).
+//
+// NO DOUBLE-COUNTING:
+//   Each call site's PLT is patched exactly once. A call from libconscrypt_jni.so
+//   fires the hook in libconscrypt's GOT; a call from libnative.so fires in its own
+//   GOT. The same packet never crosses two patched PLT entries.
+//
+// DOMAIN RESOLUTION:
+//   try_resolve_domain runs once per fd (first send). TLS SNI/HTTP Host extraction
+//   works for plaintext NDK traffic; for Conscrypt (encrypted TLS) both parsers fail
+//   gracefully and the domain falls back to the DNS cache set at connect() time.
+
 #include "hook_send_recv.h"
 #include "hook_manager.h"
 #include "../core/flow_table.h"
 #include "../utils/tls_sni_parser.h"
 #include "../netscope_log.h"
-#include "shadowhook.h"
+#include "bytehook.h"
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -11,23 +29,14 @@
 
 namespace netscope {
 
-static void* g_stub_send     = nullptr;
-static void* g_stub_sendto   = nullptr;
-static void* g_stub_write    = nullptr;
-static void* g_stub_writev   = nullptr;
-static void* g_stub_recv     = nullptr;
-static void* g_stub_recvfrom = nullptr;
-static void* g_stub_read     = nullptr;
-static void* g_stub_readv    = nullptr;
-
-static ssize_t (*orig_send)(int, const void*, size_t, int) = nullptr;
-static ssize_t (*orig_sendto)(int, const void*, size_t, int, const struct sockaddr*, socklen_t) = nullptr;
-static ssize_t (*orig_write)(int, const void*, size_t) = nullptr;
-static ssize_t (*orig_writev)(int, const struct iovec*, int) = nullptr;
-static ssize_t (*orig_recv)(int, void*, size_t, int) = nullptr;
-static ssize_t (*orig_recvfrom)(int, void*, size_t, int, struct sockaddr*, socklen_t*) = nullptr;
-static ssize_t (*orig_read)(int, void*, size_t) = nullptr;
-static ssize_t (*orig_readv)(int, const struct iovec*, int) = nullptr;
+static bytehook_stub_t g_stub_send     = nullptr;
+static bytehook_stub_t g_stub_sendto   = nullptr;
+static bytehook_stub_t g_stub_write    = nullptr;
+static bytehook_stub_t g_stub_writev   = nullptr;
+static bytehook_stub_t g_stub_recv     = nullptr;
+static bytehook_stub_t g_stub_recvfrom = nullptr;
+static bytehook_stub_t g_stub_read     = nullptr;
+static bytehook_stub_t g_stub_readv    = nullptr;
 
 static void try_resolve_domain(int fd, const void* buf, size_t len) {
     if (FlowTable::instance().is_first_send_done(fd)) return;
@@ -44,8 +53,6 @@ static void try_resolve_domain(int fd, const void* buf, size_t len) {
         LOGD("domain-resolve: fd=%d via HTTP Host -> %s", fd, domain);
         return;
     }
-    // No SNI/Host; domain remains what was set from DNS cache at connect() time.
-    // Peek current domain for log only.
     FlowEntry e{};
     if (FlowTable::instance().get(fd, &e)) {
         if (e.domain[0])
@@ -56,8 +63,8 @@ static void try_resolve_domain(int fd, const void* buf, size_t len) {
 }
 
 static ssize_t hook_send(int fd, const void* buf, size_t len, int flags) {
-    SHADOWHOOK_STACK_SCOPE();
-    ssize_t ret = orig_send(fd, buf, len, flags);
+    BYTEHOOK_STACK_SCOPE();
+    ssize_t ret = BYTEHOOK_CALL_PREV(hook_send, fd, buf, len, flags);
     if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) {
         try_resolve_domain(fd, buf, len);
@@ -68,8 +75,8 @@ static ssize_t hook_send(int fd, const void* buf, size_t len, int flags) {
 
 static ssize_t hook_sendto(int fd, const void* buf, size_t len, int flags,
                             const struct sockaddr* dest, socklen_t dest_len) {
-    SHADOWHOOK_STACK_SCOPE();
-    ssize_t ret = orig_sendto(fd, buf, len, flags, dest, dest_len);
+    BYTEHOOK_STACK_SCOPE();
+    ssize_t ret = BYTEHOOK_CALL_PREV(hook_sendto, fd, buf, len, flags, dest, dest_len);
     if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) {
         try_resolve_domain(fd, buf, len);
@@ -79,8 +86,8 @@ static ssize_t hook_sendto(int fd, const void* buf, size_t len, int flags,
 }
 
 static ssize_t hook_write(int fd, const void* buf, size_t len) {
-    SHADOWHOOK_STACK_SCOPE();
-    ssize_t ret = orig_write(fd, buf, len);
+    BYTEHOOK_STACK_SCOPE();
+    ssize_t ret = BYTEHOOK_CALL_PREV(hook_write, fd, buf, len);
     if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) {
         try_resolve_domain(fd, buf, len);
@@ -90,20 +97,16 @@ static ssize_t hook_write(int fd, const void* buf, size_t len) {
 }
 
 static ssize_t hook_writev(int fd, const struct iovec* iov, int iovcnt) {
-    SHADOWHOOK_STACK_SCOPE();
-    ssize_t ret = orig_writev(fd, iov, iovcnt);
+    BYTEHOOK_STACK_SCOPE();
+    ssize_t ret = BYTEHOOK_CALL_PREV(hook_writev, fd, iov, iovcnt);
     if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
-    if (ret > 0) {
-        // SNI/Host extraction skipped for writev: iov is a scatter buffer,
-        // not a contiguous packet. Domain should be set via connect (DNS) or send/write.
-        FlowTable::instance().add_tx(fd, static_cast<uint64_t>(ret));
-    }
+    if (ret > 0) FlowTable::instance().add_tx(fd, static_cast<uint64_t>(ret));
     return ret;
 }
 
 static ssize_t hook_recv(int fd, void* buf, size_t len, int flags) {
-    SHADOWHOOK_STACK_SCOPE();
-    ssize_t ret = orig_recv(fd, buf, len, flags);
+    BYTEHOOK_STACK_SCOPE();
+    ssize_t ret = BYTEHOOK_CALL_PREV(hook_recv, fd, buf, len, flags);
     if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) FlowTable::instance().add_rx(fd, static_cast<uint64_t>(ret));
     return ret;
@@ -111,60 +114,57 @@ static ssize_t hook_recv(int fd, void* buf, size_t len, int flags) {
 
 static ssize_t hook_recvfrom(int fd, void* buf, size_t len, int flags,
                               struct sockaddr* src, socklen_t* src_len) {
-    SHADOWHOOK_STACK_SCOPE();
-    ssize_t ret = orig_recvfrom(fd, buf, len, flags, src, src_len);
+    BYTEHOOK_STACK_SCOPE();
+    ssize_t ret = BYTEHOOK_CALL_PREV(hook_recvfrom, fd, buf, len, flags, src, src_len);
     if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) FlowTable::instance().add_rx(fd, static_cast<uint64_t>(ret));
     return ret;
 }
 
 static ssize_t hook_read(int fd, void* buf, size_t len) {
-    SHADOWHOOK_STACK_SCOPE();
-    ssize_t ret = orig_read(fd, buf, len);
+    BYTEHOOK_STACK_SCOPE();
+    ssize_t ret = BYTEHOOK_CALL_PREV(hook_read, fd, buf, len);
     if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) FlowTable::instance().add_rx(fd, static_cast<uint64_t>(ret));
     return ret;
 }
 
 static ssize_t hook_readv(int fd, const struct iovec* iov, int iovcnt) {
-    SHADOWHOOK_STACK_SCOPE();
-    ssize_t ret = orig_readv(fd, iov, iovcnt);
+    BYTEHOOK_STACK_SCOPE();
+    ssize_t ret = BYTEHOOK_CALL_PREV(hook_readv, fd, iov, iovcnt);
     if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) FlowTable::instance().add_rx(fd, static_cast<uint64_t>(ret));
     return ret;
 }
 
-#define HOOK(stub, lib, sym, fn, orig) \
-    stub = shadowhook_hook_sym_name(lib, sym, reinterpret_cast<void*>(fn), reinterpret_cast<void**>(orig))
-
 void install_hook_send_recv() {
-    HOOK(g_stub_send,     "libc.so", "send",     hook_send,     &orig_send);
-    HOOK(g_stub_sendto,   "libc.so", "sendto",   hook_sendto,   &orig_sendto);
-    HOOK(g_stub_write,    "libc.so", "write",    hook_write,    &orig_write);
-    HOOK(g_stub_writev,   "libc.so", "writev",   hook_writev,   &orig_writev);
-    HOOK(g_stub_recv,     "libc.so", "recv",     hook_recv,     &orig_recv);
-    HOOK(g_stub_recvfrom, "libc.so", "recvfrom", hook_recvfrom, &orig_recvfrom);
-    HOOK(g_stub_read,     "libc.so", "read",     hook_read,     &orig_read);
-    HOOK(g_stub_readv,    "libc.so", "readv",    hook_readv,    &orig_readv);
+    g_stub_send     = bytehook_hook_all(nullptr, "send",     (void*)hook_send,     nullptr, nullptr);
+    g_stub_sendto   = bytehook_hook_all(nullptr, "sendto",   (void*)hook_sendto,   nullptr, nullptr);
+    g_stub_write    = bytehook_hook_all(nullptr, "write",    (void*)hook_write,    nullptr, nullptr);
+    g_stub_writev   = bytehook_hook_all(nullptr, "writev",   (void*)hook_writev,   nullptr, nullptr);
+    g_stub_recv     = bytehook_hook_all(nullptr, "recv",     (void*)hook_recv,     nullptr, nullptr);
+    g_stub_recvfrom = bytehook_hook_all(nullptr, "recvfrom", (void*)hook_recvfrom, nullptr, nullptr);
+    g_stub_read     = bytehook_hook_all(nullptr, "read",     (void*)hook_read,     nullptr, nullptr);
+    g_stub_readv    = bytehook_hook_all(nullptr, "readv",    (void*)hook_readv,    nullptr, nullptr);
 
-    LOGI("hook_send_recv(libc): send=%p sendto=%p write=%p writev=%p "
+    LOGI("hook_send_recv(all libs): send=%p sendto=%p write=%p writev=%p "
          "recv=%p recvfrom=%p read=%p readv=%p",
          g_stub_send, g_stub_sendto, g_stub_write, g_stub_writev,
          g_stub_recv, g_stub_recvfrom, g_stub_read, g_stub_readv);
 
     if (!g_stub_send || !g_stub_write || !g_stub_recv || !g_stub_read)
-        LOGE("hook_send_recv: one or more critical libc.so hooks failed");
+        LOGE("hook_send_recv: one or more critical hooks failed");
 }
 
 void uninstall_hook_send_recv() {
-    if (g_stub_send)     { shadowhook_unhook(g_stub_send);     g_stub_send = nullptr; }
-    if (g_stub_sendto)   { shadowhook_unhook(g_stub_sendto);   g_stub_sendto = nullptr; }
-    if (g_stub_write)    { shadowhook_unhook(g_stub_write);    g_stub_write = nullptr; }
-    if (g_stub_writev)   { shadowhook_unhook(g_stub_writev);   g_stub_writev = nullptr; }
-    if (g_stub_recv)     { shadowhook_unhook(g_stub_recv);     g_stub_recv = nullptr; }
-    if (g_stub_recvfrom) { shadowhook_unhook(g_stub_recvfrom); g_stub_recvfrom = nullptr; }
-    if (g_stub_read)     { shadowhook_unhook(g_stub_read);     g_stub_read = nullptr; }
-    if (g_stub_readv)    { shadowhook_unhook(g_stub_readv);    g_stub_readv = nullptr; }
+    if (g_stub_send)     { bytehook_unhook(g_stub_send);     g_stub_send = nullptr; }
+    if (g_stub_sendto)   { bytehook_unhook(g_stub_sendto);   g_stub_sendto = nullptr; }
+    if (g_stub_write)    { bytehook_unhook(g_stub_write);    g_stub_write = nullptr; }
+    if (g_stub_writev)   { bytehook_unhook(g_stub_writev);   g_stub_writev = nullptr; }
+    if (g_stub_recv)     { bytehook_unhook(g_stub_recv);     g_stub_recv = nullptr; }
+    if (g_stub_recvfrom) { bytehook_unhook(g_stub_recvfrom); g_stub_recvfrom = nullptr; }
+    if (g_stub_read)     { bytehook_unhook(g_stub_read);     g_stub_read = nullptr; }
+    if (g_stub_readv)    { bytehook_unhook(g_stub_readv);    g_stub_readv = nullptr; }
 }
 
 } // namespace netscope

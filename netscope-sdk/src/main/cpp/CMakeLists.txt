@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.22.1)
 project("netscope")
 
-add_library(shadowhook SHARED IMPORTED)
-set_target_properties(shadowhook PROPERTIES
-    IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/shadowhook/libs/${ANDROID_ABI}/libshadowhook.so
-    INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/shadowhook/include
+add_library(bytehook SHARED IMPORTED)
+set_target_properties(bytehook PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/bytehook/libs/${ANDROID_ABI}/libbytehook.so
+    INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/bytehook/include
 )
 
 add_library(netscope SHARED
@@ -13,7 +13,6 @@ add_library(netscope SHARED
     hook/hook_connect.cpp
     hook/hook_dns.cpp
     hook/hook_send_recv.cpp
-    hook/hook_conscrypt.cpp
     hook/hook_close.cpp
     core/dns_cache.cpp
     core/flow_table.cpp
@@ -25,7 +24,7 @@ add_library(netscope SHARED
 target_include_directories(netscope PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(netscope
-    shadowhook
+    bytehook
     log
     android
 )

@@ -2,7 +2,7 @@
 #include "hook_manager.h"
 #include "../core/dns_cache.h"
 #include "../netscope_log.h"
-#include "shadowhook.h"
+#include "bytehook.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -10,13 +10,12 @@
 
 namespace netscope {
 
-static void* g_stub = nullptr;
-static int (*orig_getaddrinfo)(const char*, const char*, const struct addrinfo*, struct addrinfo**) = nullptr;
+static bytehook_stub_t g_stub = nullptr;
 
 static int hook_getaddrinfo(const char* node, const char* service,
                              const struct addrinfo* hints, struct addrinfo** res) {
-    SHADOWHOOK_STACK_SCOPE();
-    int ret = orig_getaddrinfo(node, service, hints, res);
+    BYTEHOOK_STACK_SCOPE();
+    int ret = BYTEHOOK_CALL_PREV(hook_getaddrinfo, node, service, hints, res);
     if (hook_manager_is_paused() || ret != 0 || !node || !res || !*res) return ret;
 
     int stored = 0;
@@ -38,16 +37,13 @@ static int hook_getaddrinfo(const char* node, const char* service,
 }
 
 void install_hook_dns() {
-    g_stub = shadowhook_hook_sym_name(
-        "libc.so", "getaddrinfo",
-        reinterpret_cast<void*>(hook_getaddrinfo),
-        reinterpret_cast<void**>(&orig_getaddrinfo));
+    g_stub = bytehook_hook_all(nullptr, "getaddrinfo", (void*)hook_getaddrinfo, nullptr, nullptr);
     if (g_stub) LOGI("hook_dns: installed");
     else        LOGE("hook_dns: install failed");
 }
 
 void uninstall_hook_dns() {
-    if (g_stub) { shadowhook_unhook(g_stub); g_stub = nullptr; }
+    if (g_stub) { bytehook_unhook(g_stub); g_stub = nullptr; }
 }
 
 } // namespace netscope
