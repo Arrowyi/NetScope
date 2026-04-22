@@ -17,7 +17,7 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags "-std=c++17 -fexceptions -frtti"
-                arguments "-DANDROID_STL=c++_shared", "-DCMAKE_BUILD_TYPE=Release"
+                arguments "-DANDROID_STL=c++_shared"
                 abiFilters 'arm64-v8a', 'armeabi-v7a'
             }
         }
@@ -40,13 +40,6 @@ android {
         }
     }
 
-    buildFeatures { prefab true }
-
-    packagingOptions {
-        jniLibs {
-            pickFirsts += ['**/libshadowhook.so']
-        }
-    }
 
     publishing {
         singleVariant('release') { withSourcesJar() }

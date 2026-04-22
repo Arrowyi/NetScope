@@ -1,7 +1,11 @@
 cmake_minimum_required(VERSION 3.22.1)
 project("netscope")
 
-find_package(shadowhook REQUIRED CONFIG)
+add_library(shadowhook SHARED IMPORTED)
+set_target_properties(shadowhook PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/shadowhook/libs/${ANDROID_ABI}/libshadowhook.so
+    INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/shadowhook/include
+)
 
 add_library(netscope SHARED
     netscope_jni.cpp
@@ -21,7 +25,7 @@ add_library(netscope SHARED
 target_include_directories(netscope PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(netscope
-    shadowhook::shadowhook
+    shadowhook
     log
     android
 )
