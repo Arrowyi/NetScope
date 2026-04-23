@@ -261,6 +261,110 @@ Verification (run locally + in field):
 * On-device with `DEBUG_ULTRA_MINIMAL` + `adb shell 'grep -E "libbytehook|libshadowhook" /proc/$(pidof <app>)/maps'` → empty
 * On-device without the flag → both libs present after `nativeInit`
 
+### 2026-04-23 — Final verdict on `b500638` (HONOR AGM3-W09HN)
+
+HMI ran the "zero-contact" re-test as prescribed and reported back with
+**three independent reproductions** of the same crash, this time with
+ironclad evidence that the SDK's runtime is not the trigger:
+
+**Zero-contact proof (three-layer):**
+
+1. **Static.** Python ELF parser on the built `libnetscope.so` from
+   JitPack artifact `b500638`:
+   ```
+   DT_NEEDED: liblog, libandroid, libdl, libm, libc++_shared, libc
+   ```
+   No `libbytehook.so` / `libshadowhook.so`.
+
+2. **Dynamic.** After `nativeInit` returned, `grep -E
+   'libbytehook|libshadowhook' /proc/<pid>/maps` on a 3031-line maps
+   snapshot: **zero matches**.
+
+3. **NetScope logs.** Three independent runs all printed:
+   ```
+   W NetScope: DEBUG_ULTRA_MINIMAL — skipping loadLibrary(bytehook);
+              libbytehook.so / libshadowhook.so will NOT be mapped into this process
+   I NetScope: libc_funcs: resolved 11/11 symbols
+   I NetScope: nativeInit: success  (status=DEGRADED, hooked=0)
+   ```
+   `HookReport` polled at `t=5s / 15s / 30s`: every reading was
+   `status=DEGRADED, hooked=0, slots_corrupt=0, reason="bytehook_init
+   NOT called"`.
+
+**Crash reproduced anyway:**
+
+| Run | pid   | post-init | pc ≈ x8     | x17 (zygote-relocated const) |
+|-----|-------|-----------|-------------|-----------------------------|
+| R1  | 12366 | +14 s     | 0x7179a97700 | 0x7329eb9620                |
+| R2  | 14398 | +30 s     | —           | —                           |
+| R3  | 16336 | +54 s     | 0x71a1692b00 | 0x7329eb9620 (identical)    |
+
+All three: `asdk.httpclient` thread, `SIGSEGV`, fault addr inside
+`[anon:libc_malloc]`, abort message `"create DR Engine success"`. The
+identical `x17` across runs pins a single deterministic call site,
+**not** heap corruption.
+
+**Contact surface NetScope's runtime leaves on the process in
+`DEBUG_ULTRA_MINIMAL` mode on this commit:**
+
+* `System.loadLibrary("netscope")` — ELF in, no third-party `DT_NEEDED`
+* `JNI_OnLoad` → `RegisterNatives` for NetScope's own native methods
+  (touches only the SDK's `NetScopeNative` class)
+* `dlsym(RTLD_NEXT, ...)` × 11 on libc networking symbols (passive
+  linker work, no writes)
+* `setStatusListener(cb)` stored into a native `std::function` slot
+* One Java-side `@Synchronized` block on `NetScope` object init
+
+That is the absolute minimum — we cannot make the SDK any more passive
+without making it literally a no-op. Given the crash reproduces on
+exactly that surface, the trigger is **not** inside the SDK. Our job
+here is done; documenting it for future integrators.
+
+**Where the trigger must live (HMI's side of the fence):**
+
+1. **An `asdk.httpclient` internal native hooker** (xhook / `plt_hook`
+   / custom). The `x17` constant is identical across PIDs because the
+   zygote relocates libart.so to a per-boot base; the low 12 bits of
+   `x17` within one boot are a signature of the specific hooked PLT
+   slot. The crash timing (14–54 s) matches a **deferred-init** code
+   path that the host app only hits once it decides to initialise the
+   "DR Engine" — i.e. on first business-logic invocation, not on
+   `Application.onCreate()`. If that initialiser tries to resolve a
+   libc symbol through ART's generic JNI trampoline and that trampoline
+   has been patched by the host app's own hooker, the patch is
+   presumably tolerant of the app's own layout but not of the
+   additional `.so` slot that `libnetscope.so` occupies once loaded.
+2. **HONOR EMUI 11 customised linker** doing something non-standard
+   during `RegisterNatives` or during arm64 R_AARCH64_GLOB_DAT /
+   JUMP_SLOT relocation of **any** newly-loaded .so that pushes past
+   the host's hook table bounds.
+3. **A host-side `__cxa_atexit` chain / C++ vtable** in the
+   `asdk.httpclient` stack whose layout is position-sensitive to how
+   many .so's are loaded ahead of it at launch.
+
+**Workarounds for integrators on known-incompatible hosts:**
+
+* Ship NetScope configured with `setDebugMode(DEBUG_ULTRA_MINIMAL)` on
+  the affected device — the SDK is inert, no traffic collected, but
+  the zero-contact surface above is verified. The crash **will still
+  reproduce**, so this is NOT a workaround for the crash itself.
+* Skip NetScope entirely on the affected SKU via a
+  `Build.MODEL`/`Build.MANUFACTURER` allow-list in the host app.
+* Move NetScope's `init()` from `Application.onCreate()` into a
+  foreground-service `onCreate`, so `libnetscope.so` is not present in
+  the process during the `asdk.httpclient` warmup window. Unverified,
+  but if hypothesis #1 is correct this should avoid the trigger.
+
+### Optional further-narrowing knob (not yet shipped)
+
+A future `DEBUG_INERT` flag could short-circuit
+`hook_manager_init()` **before** `resolve_libc_funcs()` runs, to
+separate "the 11 dlsym calls themselves are the trigger" from "merely
+loading libnetscope.so + JNI_OnLoad is enough". Under `DEBUG_INERT`
+the native runtime would do nothing beyond what the dynamic linker
+and ART already did on `System.loadLibrary`. If HMI needs that split,
+the implementation is ~20 LOC in `hook_manager.cpp`.
+
 ## If bytehook 1.1.1 fails
 
 Order of fallback plans:

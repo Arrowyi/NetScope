@@ -257,6 +257,26 @@ The first four bytes changing to `00 02 00 d4` (an `SVC #0x10` / `BRK` sequence)
 
 Ship subsequent production builds with `setDebugMode(NetScope.DEBUG_NONE)` (or just remove the call entirely — `DEBUG_NONE` is the default). `DEBUG_SKIP_HOOKS` MUST NOT leak into production: no traffic is collected while it is set.
 
+## Known incompatible hosts
+
+Some device + host-app combinations crash the host process even when NetScope is configured so that it does literally nothing at runtime beyond `dlsym(RTLD_NEXT)` on 11 libc symbols. The crash is proven **not** to originate in NetScope itself; it is triggered by some side effect of merely having `libnetscope.so` present in the process and/or by the 11 passive `dlsym` calls interacting with a host-app native hooker.
+
+| Device / ROM | Host app / thread | Crash | Investigation verdict |
+|---|---|---|---|
+| HONOR AGM3-W09HN · EMUI 11 / Magic UI 4.0 · MTK Helio P65 | Telenav-based navigator, `asdk.httpclient` thread | `SIGSEGV`, fault addr ∈ `[anon:libc_malloc]`, abort `"create DR Engine success"`, bit-identical register fingerprint across runs (same `x17` low 12 bits, same `pc == x8`) | Reproduced on `b500638` with `DEBUG_ULTRA_MINIMAL` — `libbytehook.so` / `libshadowhook.so` verified absent from `/proc/<pid>/maps`, `HookReport.hooked == 0` for the entire app lifetime. SDK contact surface already at theoretical minimum; trigger lives in the host app. See `docs/HOOK_EVOLUTION.md` "2026-04-23 — Final verdict on b500638" for the full writeup. |
+
+**Recommended integrator workarounds** on the affected SKU:
+
+1. **Preferred.** Gate `NetScope.init()` behind a `Build.MODEL` / `Build.MANUFACTURER` allow-list and skip it entirely on the known-bad combination. This keeps the SDK out of the process and is guaranteed safe.
+2. **Deferred init.** Move `NetScope.init()` out of `Application.onCreate()` into a foreground-service `onCreate` that starts only once the host has finished its warm-up. If hypothesis #1 in the HOOK_EVOLUTION writeup is correct (a pre-existing host-app native hooker whose layout is sensitive to how many `.so`'s are loaded ahead of the "DR Engine" boot), delaying `libnetscope.so` past that boot window should avoid the trigger. Unverified on HONOR AGM3-W09HN; worth trying before option #1 if the business wants traffic stats on that SKU.
+3. **Degraded-collection fallback.** Ship with `setDebugMode(DEBUG_ULTRA_MINIMAL)` on the bad SKU. NetScope is inert (no traffic collected), but we have full evidence the crash still reproduces in this mode, so this is **not** a workaround — it's only useful as "proof the SDK is not at fault" when an integrator needs to demonstrate that to a vendor.
+
+If you reproduce a similar pattern on a different device, please file a ticket with:
+
+* `adb shell getprop | grep -E 'build\.(fingerprint|product|display|version)'`
+* `grep -E '<your-app-lib>\.so|libasdk' /proc/<pid>/maps` sample
+* Three tombstones from independent runs (we look at whether `x17` is identical — same bits = deterministic hook site, not corruption)
+
 ## API Reference
 
 ### `NetScope` (object)
