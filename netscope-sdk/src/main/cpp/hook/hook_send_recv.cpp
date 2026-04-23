@@ -18,11 +18,11 @@
 
 #include "hook_send_recv.h"
 #include "hook_manager.h"
+#include "hook_stubs.h"
 #include "libc_funcs.h"
 #include "../core/flow_table.h"
 #include "../utils/tls_sni_parser.h"
 #include "../netscope_log.h"
-#include "xhook.h"
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -144,8 +144,7 @@ static ssize_t hook_readv(int fd, const struct iovec* iov, int iovcnt) {
 int install_hook_send_recv() {
     int failures = 0;
 #define REG(sym, fn) \
-    do { int r = xhook_register(".*\\.so$", sym, (void*)(fn), nullptr); \
-         if (r != 0) { LOGE("hook_send_recv: register '%s' failed ret=%d", sym, r); ++failures; } } while(0)
+    do { if (register_stub(".*\\.so$", sym, (void*)(fn), nullptr) != 0) ++failures; } while(0)
 
     REG("send",     hook_send);
     REG("sendto",   hook_sendto);

@@ -1,11 +1,11 @@
 #include "hook_connect.h"
 #include "hook_manager.h"
+#include "hook_stubs.h"
 #include "libc_funcs.h"
 #include "../core/flow_table.h"
 #include "../core/dns_cache.h"
 #include "../utils/ip_utils.h"
 #include "../netscope_log.h"
-#include "xhook.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 
@@ -36,9 +36,7 @@ static int hook_connect(int sockfd, const struct sockaddr* addr, socklen_t addrl
 
 int install_hook_connect() {
     // `orig_*` out-param intentionally null — we don't rely on it.
-    int ret = xhook_register(".*\\.so$", "connect", (void*)hook_connect, nullptr);
-    if (ret != 0) LOGE("hook_connect: xhook_register failed ret=%d", ret);
-    return ret;
+    return register_stub(".*\\.so$", "connect", (void*)hook_connect, nullptr);
 }
 
 void verify_hook_connect() {

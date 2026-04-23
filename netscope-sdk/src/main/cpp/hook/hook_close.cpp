@@ -1,10 +1,10 @@
 #include "hook_close.h"
 #include "hook_manager.h"
+#include "hook_stubs.h"
 #include "libc_funcs.h"
 #include "../core/flow_table.h"
 #include "../core/stats_aggregator.h"
 #include "../netscope_log.h"
-#include "xhook.h"
 #include <unistd.h>
 #include <cstring>
 
@@ -36,9 +36,7 @@ static int hook_close(int fd) {
 }
 
 int install_hook_close() {
-    int ret = xhook_register(".*\\.so$", "close", (void*)hook_close, nullptr);
-    if (ret != 0) LOGE("hook_close: xhook_register failed ret=%d", ret);
-    return ret;
+    return register_stub(".*\\.so$", "close", (void*)hook_close, nullptr);
 }
 
 void verify_hook_close() {

@@ -1,9 +1,9 @@
 #include "hook_dns.h"
 #include "hook_manager.h"
+#include "hook_stubs.h"
 #include "libc_funcs.h"
 #include "../core/dns_cache.h"
 #include "../netscope_log.h"
-#include "xhook.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -40,9 +40,7 @@ static int hook_getaddrinfo(const char* node, const char* service,
 }
 
 int install_hook_dns() {
-    int ret = xhook_register(".*\\.so$", "getaddrinfo", (void*)hook_getaddrinfo, nullptr);
-    if (ret != 0) LOGE("hook_dns: xhook_register failed ret=%d", ret);
-    return ret;
+    return register_stub(".*\\.so$", "getaddrinfo", (void*)hook_getaddrinfo, nullptr);
 }
 
 void verify_hook_dns() {

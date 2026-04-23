@@ -18,6 +18,7 @@ add_library(netscope SHARED
     hook/hook_close.cpp
     hook/libc_funcs.cpp
     hook/got_audit.cpp
+    hook/hook_stubs.cpp
     core/dns_cache.cpp
     core/flow_table.cpp
     core/stats_aggregator.cpp

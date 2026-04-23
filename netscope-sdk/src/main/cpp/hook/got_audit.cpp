@@ -1,4 +1,5 @@
 #include "got_audit.h"
+#include "hook_stubs.h"
 #include "libc_funcs.h"
 #include "../netscope_log.h"
 
@@ -68,7 +69,21 @@ static void ensure_netscope_text() {
     }
 }
 
+// Value exactly matches one of the `new_func` pointers we passed to
+// xhook_register. This is the ONLY correct definition of "our stub" —
+// earlier builds used a range check over libnetscope.so's .text segment
+// and produced lots of false positives (xhook's own internal registry
+// legitimately stores these addresses in heap pages, as does bionic's
+// sigaction table for our SEGV guard).
 static bool is_our_stub(uintptr_t v) {
+    return is_registered_stub(reinterpret_cast<void*>(v));
+}
+
+// Whether `v` lies anywhere within libnetscope.so's executable segment.
+// Diagnostic only — "an address that looks like NetScope code but isn't
+// one of our registered stubs" (helper, static, sigaction handler, etc).
+[[maybe_unused]]
+static bool is_in_our_text(uintptr_t v) {
     return g_netscope_text.end > g_netscope_text.start
         && v >= g_netscope_text.start && v < g_netscope_text.end;
 }
@@ -304,9 +319,20 @@ static int audit_cb(struct dl_phdr_info* info, size_t, void* data) {
 // app is about to crash the moment that object is used as a function
 // pointer / vtable.
 
+// Sweep rw-p anonymous regions for exact copies of our registered stub
+// pointers. This is a DIAGNOSTIC — not a correctness check. Legitimate
+// references abound:
+//   - xhook's own xh_core_hook_info_t linked list stores every new_func
+//     we passed to xhook_register()
+//   - bionic's sigaction() handler table stores our SIGSEGV guard
+//   - soinfo / dl_phdr_info may store libnetscope.dlpi_addr
+// A nonzero hit count WITH a clean slots_corrupt scan means "everything
+// is fine" — the real GOT is healthy and these heap copies are just
+// bookkeeping. We log them for offline triage but do not change status.
 static void scan_anon_for_stubs(AuditCtx* ctx) {
     constexpr size_t kMaxScanBytes = 256ULL * 1024 * 1024;
-    constexpr int    kMaxHits      = 32;
+    constexpr int    kMaxLoggedHits = 8;   // keep log volume low
+    constexpr int    kMaxHits       = 64;  // stop counting after this
     size_t budget = kMaxScanBytes;
     for (const auto& r : *ctx->maps) {
         if (budget == 0) break;
@@ -321,17 +347,22 @@ static void scan_anon_for_stubs(AuditCtx* ctx) {
         const size_t words = take / sizeof(uintptr_t);
         for (size_t i = 0; i < words; ++i) {
             const uintptr_t v = p[i];
-            if (is_our_stub(v)) {
-                ctx->result.anon_stub_hits++;
+            if (!is_our_stub(v)) continue;
+
+            ctx->result.anon_stub_hits++;
+            if (ctx->result.anon_stub_hits <= kMaxLoggedHits) {
                 uintptr_t at = r.start + i * sizeof(uintptr_t);
-                LOGE("got_audit: stub %p found at %p in '%s' — xhook wrote into heap",
+                LOGI("got_audit: stub %p at %p in '%s' "
+                     "(likely xhook registry / sigaction table / soinfo copy)",
                      (void*)v, (void*)at,
                      r.path.empty() ? "(anon)" : r.path.c_str());
-                note_detail(ctx, "stub-in-heap:%p at %p in %s",
-                            (void*)v, (void*)at,
-                            r.path.empty() ? "(anon)" : r.path.c_str());
-                if (ctx->result.anon_stub_hits >= kMaxHits) return;
+                if (ctx->result.anon_stub_hits == 1) {
+                    note_detail(ctx, "stub-in-meta:%p at %p in %s",
+                                (void*)v, (void*)at,
+                                r.path.empty() ? "(anon)" : r.path.c_str());
+                }
             }
+            if (ctx->result.anon_stub_hits >= kMaxHits) return;
         }
     }
 }
@@ -340,6 +371,14 @@ static void scan_anon_for_stubs(AuditCtx* ctx) {
 
 GotAuditResult audit_got(bool scan_anon_heap) {
     ensure_netscope_text();
+
+    // Sanity: how many distinct stubs did we register with xhook? The
+    // audit's "hooked vs corrupt" decision only works if this is nonzero.
+    {
+        void* stubs[32];
+        size_t n = registered_stubs_snapshot(stubs, 32);
+        LOGI("got_audit: %zu registered stubs tracked", n);
+    }
 
     AuditCtx ctx{};
     std::vector<MapRegion> maps;

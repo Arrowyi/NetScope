@@ -165,23 +165,23 @@ val report = NetScope.getHookReport()
 | A runtime `dlopen` triggered an xhook refresh that crashed (rare, vendor-specific GOT layouts) — SDK rolled back, host app keeps running | `DEGRADED` |
 | `xhook_refresh` crashed during initial install → fully rolled back | `FAILED` |
 | A critical libc symbol (connect / send / recv / read) failed to resolve via dlsym | `FAILED` |
-| **Post-install audit detected GOT writes landing in non-executable memory** (see `auditSlotsCorrupt` / `auditHeapStubHits` below) | `FAILED` |
+| **Post-install audit detected GOT writes landing in non-executable memory** (`auditSlotsCorrupt > 0`, see below) | `FAILED` |
 
 When the status is `FAILED`, NetScope's hook handlers short-circuit and stop collecting data, future `dlopen`s no longer trigger `xhook_refresh` (to prevent further memory corruption), and your app's network calls continue to work as if NetScope weren't there.
 
 ### Post-install GOT audit
 
-Right after `xhook_refresh()`, NetScope walks every loaded `.so` via `dl_iterate_phdr`, reads the actual GOT entry for each of the ~11 libc symbols we patch, and classifies what the GOT currently holds:
+Right after `xhook_refresh()`, NetScope walks every loaded `.so` via `dl_iterate_phdr`, reads the actual GOT entry for each of the ~13 libc symbols we patch, and classifies what the GOT currently holds. A slot's value is matched **exactly** against the set of pointers we passed to `xhook_register()`:
 
 | Audit bucket | Meaning |
 |---|---|
-| `auditSlotsHooked`   | GOT points to a NetScope stub — correct. |
-| `auditSlotsUnhooked` | GOT still holds the real libc pointer — lib was excluded or loaded too late. Benign. |
-| `auditSlotsChained`  | GOT points into some other library's executable region — a third-party hooker got there first. Not our crash. |
-| `auditSlotsCorrupt`  | **GOT points into `rw-p` data / `[anon:libc_malloc]` / unmapped memory** — xhook wrote to the wrong page. Forces `FAILED`. |
-| `auditHeapStubHits`  | A NetScope stub address was found sitting inside a rw-p anonymous heap page (i.e. xhook wrote into the host app's heap). Forces `FAILED`. |
+| `auditSlotsHooked`   | GOT value exactly equals a NetScope stub pointer — correct. |
+| `auditSlotsUnhooked` | GOT still holds the real libc pointer — that lib was excluded or loaded too late. Benign. |
+| `auditSlotsChained`  | GOT points into some other library's executable region — a third-party hooker got there first. Not a crash. |
+| `auditSlotsCorrupt`  | **GOT points into `rw-p` data / unmapped memory** — xhook wrote to a non-executable page and this slot would crash on call. **Forces `FAILED` + rollback.** |
+| `auditHeapStubHits`  | Advisory / diagnostic only. Counts how many copies of NetScope stub pointers are sitting inside rw-p anonymous memory. **This does NOT force `FAILED`** — legitimate copies are expected (xhook's own `xh_core_hook_info_t` registry, bionic's sigaction handler table, soinfo / dl_phdr_info snapshots). |
 
-The audit also calls `xhook_clear()` which writes the pre-hook values back into every patched location; when the corruption happened into heap memory that hasn't been read yet, this typically undoes the damage before the host app crashes.
+Only `auditSlotsCorrupt > 0` triggers rollback. When it happens the audit calls `xhook_clear()` which writes pre-hook values back into every patched location; when the misrouted write hit heap memory that hasn't been read yet this typically undoes the damage before the host app crashes.
 
 ## API Reference
 
@@ -268,9 +268,11 @@ Additionally, `xhook_refresh` (both the initial install and any dlopen-triggered
 
 ### Environmental
 
-- **`extractNativeLibs="false"` on some OEM ROMs** (most notably HONOR Android 10, Knox-derived builds): the bionic linker maps native libraries directly out of `base.apk` as multiple segments, each reporting a synthesized path like `base.apk!/lib/arm64-v8a/libX.so`. xhook 1.2.0's ELF parser has been observed to mis-compute GOT addresses for this layout, occasionally writing stub pointers into rw-p anonymous heap memory instead of real GOT slots — which corrupts a random C++ object and crashes the host app with `pc == x8` in `[anon:libc_malloc]`. NetScope's post-install audit detects this and self-disables (`Status.FAILED`). If you see `auditSlotsCorrupt > 0` or `auditHeapStubHits > 0`, either:
+- **`extractNativeLibs="false"` on some OEM ROMs** (most notably HONOR Android 10, Knox-derived builds): the bionic linker maps native libraries directly out of `base.apk` as multiple segments, each reporting a synthesized path like `base.apk!/lib/arm64-v8a/libX.so`. xhook 1.2.0's ELF parser has been observed to mis-compute GOT addresses for this layout, occasionally writing stub pointers into rw-p anonymous heap memory instead of real GOT slots — which corrupts a random C++ object and crashes the host app with `pc == x8` in `[anon:libc_malloc]`. NetScope's post-install audit detects this as `auditSlotsCorrupt > 0` and self-disables (`Status.FAILED`). If you see that field nonzero, either:
   - Set `android:extractNativeLibs="true"` in your app's `AndroidManifest.xml`, or
   - Ship a build of NetScope based on bytehook / shadowhook 2.x instead of xhook (work in progress; bytehook handles APK-embedded .so layouts explicitly).
+
+  Note: `auditHeapStubHits > 0` on its own is **not** a failure. It's an advisory count of NetScope stub pointers observed inside heap pages. Legitimate copies are expected (xhook maintains an internal `xh_core_hook_info_t` registry that stores every `new_func` we passed it; bionic keeps our SIGSEGV guard in its sigaction table; the dynamic linker stores library load-base values in several places). As long as `auditSlotsCorrupt == 0`, the real GOT is healthy and traffic collection is active.
 
 ### Functional
 
