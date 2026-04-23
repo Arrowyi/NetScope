@@ -236,7 +236,30 @@ After `DEBUG_SKIP_HOOKS` and `DEBUG_ULTRA_MINIMAL` both ruled out "NetScope's GO
 
 All 6 crashes have bit-identical register fingerprints (`x17` same, `x16/lr` same 12-bit offsets into libart.so, `pc == x8 ∈ [anon:libc_malloc]`) ⇒ deterministic bad dispatch through one specific ART JNI PLT site, not random heap corruption. The row that mattered was #3: `DEBUG_SKIP_HOOKS` still crashes even though bytehook wrote zero stubs, which falsifies every "we wrote a bad pointer" hypothesis and confirms the trigger is inside `bytehook_init` itself (probably shadowhook patching an ART/libc code sequence that the AOSP pattern doesn't match on EMUI 11 / Magic UI 4.0 / MTK Helio P65).
 
-The next lever under investigation is a bytehook backend that skips `shadowhook_init` entirely — see "If bytehook 1.1.1 fails" below.
+Then HMI's round-2 with `DEBUG_ULTRA_MINIMAL` (`bytehook_init` never called, only `dlsym × 11`) ALSO crashed with the same fingerprint. init-diff confirmed the only byte-level change on the system was `libdl.so!__cfi_slowpath` — that's expected shadowhook behaviour on a normal EMUI 11 boot, NOT the trigger. **Conclusion:** the trigger fires between "`libnetscope.so` has been mapped" and "`nativeInit` returns" — i.e. somewhere in a static constructor. Suspects: `libnetscope.so` itself (no constructors we own), `libbytehook.so` (pulled in via `DT_NEEDED`), `libshadowhook.so` (bytehook's own `DT_NEEDED`).
+
+### 2026-04-23 — Mitigation: strip libbytehook.so from DT_NEEDED
+
+Committed in the same day as the round-2 triage. Changes:
+
+* `netscope-sdk/src/main/cpp/CMakeLists.txt`: `find_package(bytehook)` is used for **headers only**; `target_link_libraries` no longer lists `bytehook::bytehook`. Net result: `readelf -d libnetscope.so` no longer shows `[libbytehook.so]` as `DT_NEEDED`. Transitively, `libshadowhook.so` also disappears.
+* New file `hook/bytehook_runtime.{h,cpp}` provides `netscope::bh::{init,hook_all,unhook,add_ignore,set_debug,set_recordable,get_version}` — a thin dlopen+dlsym wrapper over the seven bytehook entry points NetScope uses. The first wrapper call `dlopen("libbytehook.so", RTLD_NOW | RTLD_GLOBAL)` and resolves the seven symbols once; subsequent calls are inlined-pointer dispatch.
+* `NetScopeNative.kt` no longer calls `System.loadLibrary("bytehook")` in its static initialiser. Instead `NetScope.init()` does a late, guarded `tryLoadBytehook()` — **except** when `DEBUG_ULTRA_MINIMAL` is set, in which case bytehook is never loaded at all and `libbytehook.so` / `libshadowhook.so` never appear in `/proc/self/maps`.
+
+Kill-switch semantics after this commit:
+
+| Flag | libbytehook.so mapped? | libshadowhook.so mapped? | `bytehook_init`? |
+|---|---|---|---|
+| default | ✔ (dlopen at init) | ✔ (transitive) | ✔ |
+| `DEBUG_SKIP_HOOKS` | ✔ | ✔ | ✔ (but no stubs) |
+| `DEBUG_ULTRA_MINIMAL` | ✘ | ✘ | ✘ |
+
+This is the cleanest kill-switch we can offer without vendoring bytehook. If `DEBUG_ULTRA_MINIMAL` on this commit still crashes, the trigger must live either inside libnetscope.so's own code (no constructors we own; only libc++_shared, libm, libandroid, liblog, libdl, libc in DT_NEEDED) or inside a host-app side effect that tracks any new `.so` in the loader list.
+
+Verification (run locally + in field):
+* `llvm-readelf -d libnetscope.so | grep NEEDED` → no `libbytehook.so`
+* On-device with `DEBUG_ULTRA_MINIMAL` + `adb shell 'grep -E "libbytehook|libshadowhook" /proc/$(pidof <app>)/maps'` → empty
+* On-device without the flag → both libs present after `nativeInit`
 
 ## If bytehook 1.1.1 fails
 

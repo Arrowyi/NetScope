@@ -6,8 +6,8 @@
 #include "hook_stubs.h"
 #include "libc_funcs.h"
 #include "got_audit.h"
+#include "bytehook_runtime.h"   // dlopen wrapper + bytehook.h types
 #include "../netscope_log.h"
-#include "bytehook.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
@@ -367,6 +367,8 @@ static const char* bytehook_init_status_name(int code) {
         case BYTEHOOK_STATUS_CODE_INITERR_CFI:       return "INITERR_CFI";
         case BYTEHOOK_STATUS_CODE_INITERR_SAFE:      return "INITERR_SAFE";
         case BYTEHOOK_STATUS_CODE_INITERR_HUB:       return "INITERR_HUB (W^X?)";
+        case netscope::bh::BYTEHOOK_STATUS_CODE_NOT_LOADED:
+            return "NOT_LOADED (libbytehook.so dlopen failed)";
         default:                                     return "unknown";
     }
 }
@@ -382,8 +384,20 @@ static int init_bytehook_once() {
     const bool bh_debug = (dbg & DEBUG_TRACE_HOOKS) != 0;
     const bool diff_on  = (dbg & DEBUG_TRACE_HOOKS) != 0;  // reuse the trace switch
 
+    // Soft-load libbytehook.so. If this fails the host app didn't ship
+    // com.bytedance:bytehook as a runtime dep; surface that distinctly
+    // from a real init-err so integrators have a clear fix.
+    int load_rc = netscope::bh::ensure_loaded();
+    if (load_rc != BYTEHOOK_STATUS_CODE_OK) {
+        s_last_rc.store(load_rc);
+        s_done.store(2);
+        LOGE("hook_manager: bytehook runtime unavailable (rc=%d) — "
+             "libbytehook.so could not be dlopen'd", load_rc);
+        return load_rc;
+    }
+
     if (diff_on) init_diff_snapshot_before();
-    int rc = bytehook_init(BYTEHOOK_MODE_MANUAL, /*debug=*/bh_debug);
+    int rc = netscope::bh::init(BYTEHOOK_MODE_MANUAL, /*debug=*/bh_debug);
     if (diff_on) init_diff_log_after();
 
     s_last_rc.store(rc);
@@ -391,12 +405,12 @@ static int init_bytehook_once() {
     LOGI("hook_manager: bytehook_init(MANUAL, debug=%s) = %d (%s), ver=%s",
          bh_debug ? "true" : "false",
          rc, bytehook_init_status_name(rc),
-         bytehook_get_version() ? bytehook_get_version() : "?");
+         netscope::bh::get_version());
     // Recordable mode lets us dump every hook action on demand later via
     // bytehook_get_records(); paired with DEBUG_TRACE_HOOKS gives HMI a
     // post-mortem dump if the logcat stream is lossy.
     if (bh_debug) {
-        bytehook_set_recordable(true);
+        netscope::bh::set_recordable(true);
     }
     return rc;
 }
@@ -425,21 +439,30 @@ int hook_manager_init() {
         return -1;
     }
 
-    // DEBUG_ULTRA_MINIMAL: hard stop — do NOT call bytehook_init at all.
+    // DEBUG_ULTRA_MINIMAL: hard stop — do NOT call bytehook_init at all
+    // AND do NOT dlopen libbytehook.so. Combined with the fact that
+    // libbytehook.so is no longer in libnetscope.so's DT_NEEDED (see
+    // CMakeLists.txt + hook/bytehook_runtime.h), this guarantees that
+    // libbytehook.so — and transitively libshadowhook.so — are NEVER
+    // mapped into the process while NetScope is in this mode. Verify
+    // in the field with `grep -E 'libbytehook|libshadowhook' /proc/<pid>/maps`;
+    // the expected output is empty.
     //
     // This is the most aggressive diagnostic: everything up to here is
     // pure dlsym(RTLD_NEXT) on libc.so (passive, no writes anywhere in
     // the process). If the app still crashes with this flag set, the
-    // culprit is something loading libnetscope.so brought into the
-    // process — NOT anything NetScope does at runtime. If the app stops
-    // crashing, the culprit lives downstream of this line and is almost
-    // certainly inside bytehook_init's shadowhook-backed CFI-disable /
-    // safe-init paths.
+    // culprit is whatever loading libnetscope.so brought into the
+    // process — NOT anything NetScope does at runtime. Prior to the
+    // 2026-04-23 DT_NEEDED fix that meant "some constructor in the
+    // bytehook / shadowhook load chain"; after the fix it can only
+    // mean "libnetscope.so's own constructors or a host-app hook on
+    // one of the 11 libc symbols NetScope calls dlsym(RTLD_NEXT) on".
     //
-    // Added 2026-04-23 per HMI's HONOR AGM3-W09HN triage: DEBUG_SKIP_HOOKS
-    // (which leaves bytehook_init intact but registers zero stubs) still
-    // crashes with the same register fingerprint, so the trigger is
-    // proven to be inside bytehook_init. This flag splits that further.
+    // History: added per HMI's HONOR AGM3-W09HN triage. DEBUG_SKIP_HOOKS
+    // (bytehook_init intact but zero stubs) still crashed identically,
+    // so we bisected further with DEBUG_ULTRA_MINIMAL. When THAT also
+    // crashed with bytehook_init never called, the ball bounced up to
+    // the DT_NEEDED chain — fixed by this commit.
     if (g_debug_flags.load() & DEBUG_ULTRA_MINIMAL) {
         char buf[160];
         std::snprintf(buf, sizeof(buf),
@@ -469,8 +492,8 @@ int hook_manager_init() {
     // Don't patch our own libraries' PLT — calls originating inside
     // libnetscope.so go to libc directly. Also ignore libbytehook.so so
     // bytehook never tries to hook itself.
-    bytehook_add_ignore("libnetscope.so");
-    bytehook_add_ignore("libbytehook.so");
+    netscope::bh::add_ignore("libnetscope.so");
+    netscope::bh::add_ignore("libbytehook.so");
 
     // DEBUG_SKIP_HOOKS: bytehook is fully initialised (including CFI
     // disable + shadowhook trampoline registration) but we deliberately

@@ -2,23 +2,40 @@ package indi.arrowyi.netscope.sdk
 
 internal object NetScopeNative {
     init {
-        // Load bytehook FIRST. libnetscope.so has a DT_NEEDED on libbytehook.so
-        // (provided by the com.bytedance:bytehook Gradle dependency). If we
-        // don't pre-load it, Android's runtime loader still finds it — but
-        // pre-loading surfaces a clearer UnsatisfiedLinkError if the app
-        // forgot to include bytehook.
-        try {
+        // IMPORTANT — we deliberately do NOT `System.loadLibrary("bytehook")`
+        // here. libnetscope.so no longer lists libbytehook.so in DT_NEEDED
+        // (see netscope-sdk/src/main/cpp/CMakeLists.txt); the native side
+        // dlopen's libbytehook.so on demand via hook/bytehook_runtime.cpp.
+        // Pre-loading bytehook here would defeat that defer-loading design
+        // on the HONOR AGM3-W09HN / EMUI 11 class of devices where
+        // bytehook/shadowhook's static constructors destabilise the host
+        // process at load time. See docs/HOOK_EVOLUTION.md 2026-04-23 entry.
+        //
+        // NetScope.init() is responsible for calling
+        // NetScope.ensureBytehookLoaded() at the appropriate moment — i.e.
+        // only when the caller actually wants hooks installed (not in
+        // DEBUG_ULTRA_MINIMAL mode).
+        System.loadLibrary("netscope")
+    }
+
+    /**
+     * Load libbytehook.so on demand. Returns `true` on success. Catches
+     * UnsatisfiedLinkError so the hook manager can surface a structured
+     * FAILED status instead of crashing the host app. Safe to call from
+     * any thread; [System.loadLibrary] is itself synchronised.
+     */
+    internal fun tryLoadBytehook(): Boolean {
+        return try {
             System.loadLibrary("bytehook")
+            true
         } catch (t: Throwable) {
-            // Don't hard-fail: let the libnetscope load below produce the
-            // authoritative error. But log the cause for debugging.
             android.util.Log.e(
                 "NetScope",
-                "loadLibrary(bytehook) failed; check that the consuming app " +
-                "depends (transitively) on com.bytedance:bytehook:1.1.1 — $t"
+                "loadLibrary(bytehook) failed; host app must depend on " +
+                "com.bytedance:bytehook:1.1.1 (as api or implementation) — $t"
             )
+            false
         }
-        System.loadLibrary("netscope")
     }
 
     external fun nativeInit(): Int        // returns 0 on ACTIVE / DEGRADED, non-zero on FAILED

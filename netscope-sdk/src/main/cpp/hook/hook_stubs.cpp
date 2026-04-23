@@ -1,8 +1,8 @@
 #include "hook_stubs.h"
 #include "hook_manager.h"
 #include "libc_funcs.h"
+#include "bytehook_runtime.h"   // dlopen wrapper + bytehook.h types
 #include "../netscope_log.h"
-#include "bytehook.h"
 
 #include <array>
 #include <atomic>
@@ -117,7 +117,7 @@ int register_stub(const char* /*pathname_regex*/,
     // Bytehook walks every loaded caller's GOT/PLT and patches the slot
     // that resolves to libc.so's `sym`. Late-loaded callers are handled
     // automatically via bytehook's internal dlopen integration.
-    bytehook_stub_t h = bytehook_hook_all(
+    bytehook_stub_t h = netscope::bh::hook_all(
         /*callee_path_name=*/"libc.so",
         /*sym_name=*/sym,
         /*new_func=*/new_func,
@@ -175,7 +175,7 @@ void unhook_all_stubs() {
     std::lock_guard<std::mutex> lk(g_stub_mtx);
     for (size_t i = 0; i < g_stub_n; ++i) {
         if (g_handles[i]) {
-            int r = bytehook_unhook(g_handles[i]);
+            int r = netscope::bh::unhook(g_handles[i]);
             if (r != 0) {
                 LOGW("hook_stubs: bytehook_unhook(%p) returned %d",
                      g_handles[i], r);

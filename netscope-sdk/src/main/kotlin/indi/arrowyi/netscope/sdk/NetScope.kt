@@ -15,6 +15,16 @@ object NetScope {
     private const val TAG = "NetScope"
     private var initialized = false
 
+    /**
+     * Mirror of the flags passed to [setDebugMode] so [init] can check
+     * them *before* calling into native code (needed because we have to
+     * decide whether to `System.loadLibrary("bytehook")` up front — it
+     * affects DT_NEEDED-level library mapping). Defaults to
+     * [DEBUG_NONE] (== 0); written as a literal because Kotlin resolves
+     * property initialisers top-to-bottom and the const val is below.
+     */
+    private var cachedDebugFlags: Int = 0
+
     // ─── Diagnostic mode flags ────────────────────────────────────────────
     //
     // Bitwise OR these into [setDebugMode]. Diagnostic-only: used to
@@ -94,6 +104,7 @@ object NetScope {
      * ```
      */
     fun setDebugMode(flags: Int) {
+        cachedDebugFlags = flags
         NetScopeNative.nativeSetDebugMode(flags)
     }
 
@@ -109,6 +120,27 @@ object NetScope {
     @Synchronized
     fun init(context: Context): Status {
         if (initialized) return getHookReport().status
+
+        // Soft-load libbytehook.so (which in turn pulls in
+        // libshadowhook.so via its own DT_NEEDED). We deliberately do
+        // this LATE — libnetscope.so itself no longer lists bytehook in
+        // DT_NEEDED (see CMakeLists.txt comment block). That gives the
+        // caller one bulletproof knob: set [DEBUG_ULTRA_MINIMAL] and
+        // libbytehook.so NEVER enters the process — use this to
+        // bisect crashes that correlate with bytehook's load-time
+        // side effects (static constructors, shadowhook CFI patch).
+        // HONOR AGM3-W09HN / EMUI 11 reproduces exactly that pattern;
+        // see docs/HOOK_EVOLUTION.md 2026-04-23.
+        if ((cachedDebugFlags and DEBUG_ULTRA_MINIMAL) != 0) {
+            Log.w(TAG, "DEBUG_ULTRA_MINIMAL — skipping loadLibrary(bytehook); " +
+                       "libbytehook.so / libshadowhook.so will NOT be mapped into this process")
+        } else {
+            val loaded = NetScopeNative.tryLoadBytehook()
+            if (!loaded) {
+                Log.w(TAG, "bytehook unavailable; native nativeInit() will return FAILED with NOT_LOADED")
+            }
+        }
+
         val ret = NetScopeNative.nativeInit()
         val report = getHookReport()
         if (ret != 0 || report.status == Status.FAILED) {
