@@ -2,16 +2,16 @@ cmake_minimum_required(VERSION 3.22.1)
 project("netscope")
 
 # Hook backend: bytehook 1.1.1 (com.bytedance:bytehook, distributed as a
-# Prefab package via the Android Gradle dependency). Bytehook is a pure
-# PLT/GOT patcher; our proxies never call BYTEHOOK_CALL_PREV, so bytehook
-# operates without installing a PROT_EXEC trampoline for the prev chain.
-# This keeps NetScope W^X-compatible on locked-down ROMs.
+# Prefab package via the Android Gradle dependency).
 #
-# History & migration rationale: docs/HOOK_EVOLUTION.md
+# W^X safety requires TWO rules, both enforced in this codebase:
+#   1. Init bytehook in BYTEHOOK_MODE_MANUAL (hook_manager.cpp).
+#   2. Never use BYTEHOOK_CALL_PREV in proxies — call the real libc
+#      via libc().fn() (hook_*.cpp + libc_funcs.{h,cpp}).
+# Under these two rules the AUTOMATIC-only path bh_trampo_alloc →
+# mmap(PROT_EXEC) is structurally unreachable; see docs/HOOK_EVOLUTION.md §P1.
 #
-# The previous xhook 1.2.0 static library is kept under third_party/xhook/
-# but NOT linked — it remains only as a quick revert path if bytehook
-# proves unusable on a specific OEM device.
+# History & full migration rationale: docs/HOOK_EVOLUTION.md
 find_package(bytehook REQUIRED CONFIG)
 
 add_library(netscope SHARED

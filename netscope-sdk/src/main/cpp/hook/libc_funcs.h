@@ -2,17 +2,25 @@
 //
 // Real libc function pointers resolved via dlsym(RTLD_NEXT) at init time.
 //
-// WHY: xhook saves the previous GOT value into `orig_*`, but the previous value
-// may already be a third-party hook's trampoline (e.g., the host app has its
-// own native HTTP stack that hooked connect/send/recv before us). Calling
-// `orig_*` then lands inside someone else's trampoline, whose private state
-// may be stale / freed, causing `pc == x8` crashes where x8 is a heap address.
+// WHY we don't use the hooker's "call-previous" mechanism (xhook's `orig_*`
+// out-parameter, bytehook's `BYTEHOOK_CALL_PREV`): the previous GOT value
+// might already be a third-party hook's trampoline. For example, the host
+// app has its own native HTTP stack that hooked connect/send/recv before
+// NetScope loaded. Chaining through "the value that was in the GOT before
+// we patched it" lands inside someone else's trampoline, whose private
+// state may be stale or freed, producing `pc == x8` crashes where x8 is
+// a heap address.
 //
-// Bypassing `orig_*` by calling the dlsym-resolved libc symbol directly
-// guarantees we always reach the real libc implementation and never chain
-// into another hooker's trampoline. NetScope's hook remains registered in the
-// target library's GOT, so we still observe traffic — we just don't call
-// "whatever was there before" on the way out.
+// Bypassing the hooker's prev-chain entirely and calling the dlsym(RTLD_NEXT)
+// resolved libc symbol directly guarantees we always reach the real libc
+// implementation and never chain into another hooker's trampoline. NetScope's
+// hook remains registered in the target library's GOT so we still observe
+// traffic — we just don't call "whatever was there before" on the way out.
+//
+// Bonus: this is also why NetScope is W^X-safe under bytehook MANUAL mode.
+// BYTEHOOK_CALL_PREV requires bytehook's hub trampoline, which in turn
+// requires bh_trampo_alloc → mmap(PROT_EXEC). By never using CALL_PREV we
+// keep that path unreachable. See docs/HOOK_EVOLUTION.md §P1.
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -35,7 +43,6 @@ struct LibcFuncs {
     ssize_t (*recvfrom)     (int, void*, size_t, int, struct sockaddr*, socklen_t*)                    = nullptr;
     ssize_t (*read)         (int, void*, size_t)                                                       = nullptr;
     ssize_t (*readv)        (int, const struct iovec*, int)                                            = nullptr;
-    void*   (*dlopen)       (const char*, int)                                                         = nullptr;
 };
 
 // Populate libc_funcs() using dlsym(RTLD_NEXT). Returns the number of

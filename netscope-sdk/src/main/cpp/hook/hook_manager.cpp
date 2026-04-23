@@ -147,8 +147,13 @@ static void install_sigsegv_guard() {
 //     dlsym(RTLD_NEXT) at init), so we never need BYTEHOOK_CALL_PREV.
 //
 // If bytehook_init still fails we surface the numeric status code verbatim
-// in the failureReason string so the HMI side can tell W^X from any other
-// failure (INITERR_TRAMPO=8, INITERR_HUB=27 are the two W^X smoking guns).
+// in the failureReason string so the HMI side can tell W^X (execmod) from
+// any other failure. In MANUAL mode the W^X smoking gun is INITERR_CFI
+// (bh_cfi_disable_slowpath uses mprotect(PROT_WRITE) on other libs' .text
+// which can be refused on execmod-strict kernels). INITERR_TRAMPO /
+// INITERR_HUB indicate bytehook hit its AUTOMATIC-mode trampoline code
+// path — that would be a regression on our side (we should always be in
+// MANUAL), not a platform problem.
 
 static const char* bytehook_init_status_name(int code) {
     switch (code) {
@@ -198,7 +203,7 @@ int hook_manager_init() {
     // directly from every hook handler instead of chaining through the
     // hooker's "prev" — see docs/HOOK_EVOLUTION.md §P2.
     int libc_ok = resolve_libc_funcs();
-    const bool libc_complete = (libc_ok >= 11);  // 11 networking + 1 dlopen (we don't use dlopen hooks with bytehook but resolve_libc_funcs still counts it)
+    const bool libc_complete = (libc_ok == 11);  // 11 networking symbols; see libc_funcs.h
     {
         std::lock_guard<std::mutex> lock(g_report_mutex);
         g_report.libc_resolved = libc_complete;
@@ -333,7 +338,7 @@ int hook_manager_init() {
     } else {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-                      "partial hooks: connect=%s dns=%s send_recv=%s close=%s libc=%d/12 "
+                      "partial hooks: connect=%s dns=%s send_recv=%s close=%s libc=%d/11 "
                       "audit slots=%d hooked=%d",
                       fail_connect   ? "FAIL" : "ok",
                       fail_dns       ? "FAIL" : "ok",

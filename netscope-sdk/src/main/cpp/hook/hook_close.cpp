@@ -10,7 +10,9 @@
 
 namespace netscope {
 
-// See libc_funcs.h — call real libc directly instead of xhook's `orig_*`.
+// See libc_funcs.h — call real libc directly instead of BYTEHOOK_CALL_PREV,
+// to avoid chaining into other hookers' trampolines and to keep bytehook
+// in MANUAL-mode's W^X-safe code path.
 
 static int hook_close(int fd) {
     if (hook_manager_is_enabled() && FlowTable::instance().contains(fd)) {

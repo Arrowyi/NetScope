@@ -11,8 +11,9 @@
 
 namespace netscope {
 
-// See libc_funcs.h — we don't use xhook's `orig_*` anymore. Call real libc
-// directly so we never chain into another hooker's trampoline.
+// See libc_funcs.h — we don't use bytehook's BYTEHOOK_CALL_PREV. Call the
+// real libc entry point directly so we never chain into another hooker's
+// trampoline (and so MANUAL-mode bytehook never needs a trampoline page).
 
 static int hook_getaddrinfo(const char* node, const char* service,
                              const struct addrinfo* hints, struct addrinfo** res) {

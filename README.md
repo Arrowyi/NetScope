@@ -10,9 +10,9 @@ A lightweight Android SDK that monitors **all network traffic** in the embedding
 
 NetScope uses **pure GOT / PLT hooking** via [bytehook](https://github.com/bytedance/bhook) (battle-tested in TikTok / Douyin). Every loaded library's GOT entries for a handful of libc network functions are redirected through NetScope's counters.
 
-- **MANUAL mode, no `BYTEHOOK_CALL_PREV` in proxies** → no shared PROT_EXEC trampoline, keeps NetScope W^X-compatible on locked-down ROMs (HMS / HONOR / Knox / IVI head-units)
-- **Calls to the real libc go through `dlsym(RTLD_NEXT)` cached pointers** — never chains back into whatever hook the host app (or a vendor libraty) may have installed first (prevents the classic "`pc == x8`, fault addr in `[anon:libc_malloc]`" crash)
-- **Handles `extractNativeLibs="false"`** — bytehook's ELF parser correctly resolves GOT addresses for libraries mapped directly out of `base.apk`, which `xhook 1.2.0` got wrong on some OEM ROMs. See [`docs/HOOK_EVOLUTION.md`](docs/HOOK_EVOLUTION.md) for the full backstory.
+- **MANUAL mode, no `BYTEHOOK_CALL_PREV` in proxies** → bytehook's AUTOMATIC-mode `bh_trampo_alloc` → `mmap(PROT_EXEC)` code path is structurally unreachable, keeping NetScope W^X-compatible on locked-down ROMs (HMS / HONOR / Knox / IVI head-units)
+- **Calls to the real libc go through `dlsym(RTLD_NEXT)` cached pointers** — never chains back into whatever hook the host app (or a vendor library) may have installed first (prevents the classic "`pc == x8`, fault addr in `[anon:libc_malloc]`" crash)
+- **Handles `extractNativeLibs="false"`** — bytehook's ELF parser correctly resolves GOT addresses for libraries mapped directly out of `base.apk`, which earlier hookers got wrong on some OEM ROMs. See [`docs/HOOK_EVOLUTION.md`](docs/HOOK_EVOLUTION.md) for the full backstory.
 - Domains are attributed via three signals:
   1. **TLS SNI** — parsed from the ClientHello plaintext
   2. **HTTP Host header** — read from plaintext HTTP
@@ -155,8 +155,9 @@ val report = NetScope.getHookReport()
 // report.connectOk / dnsOk / sendRecvOk / closeOk: per-hook booleans
 // report.libcResolved: false if dlsym for any libc symbol failed
 // report.failureReason: short string when not ACTIVE, e.g.
-//   "SIGSEGV during xhook_refresh ..."
-//   "partial hooks: connect=ok dns=FAIL send_recv=ok close=ok libc=12/12"
+//   "SIGSEGV during bytehook_hook_all (possible W^X or vendor-lib GOT layout issue)"
+//   "partial hooks: connect=ok dns=FAIL send_recv=ok close=ok libc=11/11"
+//   "bytehook_init returned 11 (INITERR_CFI) — check W^X policy / kernel mmap"
 ```
 
 ### When will you see `DEGRADED` / `FAILED`?
@@ -165,7 +166,7 @@ val report = NetScope.getHookReport()
 |---|---|
 | Everything installed cleanly and the post-install audit confirmed every GOT write went to a real GOT slot | `ACTIVE` |
 | One of the `install_hook_*` calls failed but others succeeded | `DEGRADED` |
-| `bytehook_init` failed (most commonly a W^X kernel refusing `mmap(PROT_EXEC)` — status code 8 `INITERR_TRAMPO` or 27 `INITERR_HUB`) | `FAILED` |
+| `bytehook_init` failed. In MANUAL mode the common smoking gun is `INITERR_CFI` — bytehook could not `mprotect(PROT_WRITE)` another library's `.text` to disable CFI on an SELinux `execmod`-strict kernel. (`INITERR_TRAMPO` / `INITERR_HUB` only appear if we ever accidentally flip to AUTOMATIC mode — they'd be a NetScope regression, not a platform issue.) | `FAILED` |
 | SIGSEGV during initial hook install → SDK rolled back, host app keeps running | `FAILED` |
 | A critical libc symbol (connect / send / recv / read) failed to resolve via dlsym | `FAILED` |
 | **Post-install audit detected GOT writes landing in non-executable memory** (`auditSlotsCorrupt > 0`, see below) | `FAILED` |
@@ -273,9 +274,7 @@ For the full evolution of the crash scenarios we've mitigated (shadowhook W^X �
 
 ### Environmental
 
-- **Locked-down W^X kernels** (some IVI head-units, certain Knox-derived ROMs): bytehook's internal initialisation may call `mmap(PROT_EXEC, ...)` for its dispatch hub. On kernels that enforce strict W^X this returns `EPERM` and `bytehook_init` returns a non-OK status code (`INITERR_TRAMPO=8` or `INITERR_HUB=27` are the two we've seen). NetScope surfaces this as `Status.FAILED` with the numeric code in `failureReason`, so the HMI can tell "W^X refusal" apart from any other failure. If you hit this, the current escape hatch is:
-  - Roll back to commit `6f50453` (xhook-based) for the affected device family, accepting reduced coverage under `extractNativeLibs="false"`.
-  - Or file an issue against NetScope with the `failureReason` text so we can evaluate writing our own minimal PLT patcher (≤ 300 LOC, feasible given we already parse ELF in `got_audit.cpp`).
+- **Locked-down W^X kernels** (some IVI head-units, certain Knox-derived ROMs): NetScope runs bytehook in `MANUAL` mode and never calls `BYTEHOOK_CALL_PREV`, so the AUTOMATIC-mode trampoline allocator (`bh_trampo_alloc` → `mmap(PROT_EXEC)`) is structurally unreachable. The only W^X-related failure path left is `INITERR_CFI` — bytehook calls `mprotect(PROT_WRITE)` on another library's `.text` page to patch out a CFI check, and strict `execmod` SELinux policy can deny that. NetScope surfaces the numeric status code in `failureReason` so the HMI can distinguish it from any other init failure. If you hit `INITERR_CFI` on a device you control, please file an issue — we can evaluate running without CFI-disable (at the cost of losing hooks for CFI-enabled callers), or writing our own minimal PLT patcher (we already parse ELF in `got_audit.cpp`).
 - **`extractNativeLibs="false"` on HONOR Android 10** (historical): xhook 1.2.0 mis-computed GOT addresses for `base.apk!/lib/...` layouts. Bytehook handles these correctly, so this limitation is no longer applicable.
 - `auditHeapStubHits > 0` on its own is **not** a failure. It's an advisory count of NetScope stub pointers observed inside `[anon:libc_malloc]` pages. Legitimate copies are expected (bytehook maintains an internal task registry; bionic keeps our SIGSEGV guard in its sigaction table; the dynamic linker stores library load-base values in several places). The authoritative failure signal is `auditSlotsCorrupt > 0`.
 

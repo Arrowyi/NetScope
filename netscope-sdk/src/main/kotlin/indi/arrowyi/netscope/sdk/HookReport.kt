@@ -24,18 +24,19 @@ enum class Status(val nativeValue: Int) {
     DEGRADED(2),
 
     /**
-     * A critical failure occurred:
-     * - `bytehook_init` returned a non-OK code (most commonly due to a
-     *   locked-down W^X kernel refusing `mmap(PROT_EXEC)` — see
-     *   `docs/HOOK_EVOLUTION.md §P1`), or
-     * - SIGSEGV during hook install, or
-     * - libc symbol resolution failed, or
-     * - the post-install audit detected that a GOT slot was overwritten
-     *   with a non-executable address (see [HookReport.auditSlotsCorrupt]).
+     * A critical failure occurred. Possible causes:
+     *  - `bytehook_init` returned a non-OK code. On W^X / SELinux-strict
+     *    kernels (some automotive OEM ROMs) the failure is usually
+     *    `INITERR_CFI` — bytehook could not `mprotect(PROT_WRITE)` another
+     *    library's `.text` to disable CFI. See `docs/HOOK_EVOLUTION.md §P1`.
+     *  - SIGSEGV during hook install.
+     *  - libc symbol resolution via `dlsym(RTLD_NEXT)` failed.
+     *  - The post-install audit detected that a GOT slot was overwritten
+     *    with a non-executable address (see [HookReport.auditSlotsCorrupt]).
      *
      * No traffic data will be collected for this process. Prompt the
      * user / log to crashlytics. [HookReport.failureReason] contains a
-     * short, machine-readable explanation.
+     * short, machine-readable explanation suitable for UI.
      */
     FAILED(3);
 

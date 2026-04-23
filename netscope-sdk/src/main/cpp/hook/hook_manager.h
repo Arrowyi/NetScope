@@ -22,7 +22,7 @@ enum HookStatus : int32_t {
 // full backstory on why this audit exists.
 struct HookReport {
     HookStatus status;
-    bool libc_resolved;        // all 12 libc symbols resolved via dlsym
+    bool libc_resolved;        // all 11 networking libc symbols resolved via dlsym
     bool connect_ok;
     bool dns_ok;
     bool send_recv_ok;

@@ -39,7 +39,6 @@ int resolve_libc_funcs() {
         if (g_libc.recvfrom)     ++n;
         if (g_libc.read)         ++n;
         if (g_libc.readv)        ++n;
-        if (g_libc.dlopen)       ++n;
         return n;
     }
 
@@ -55,10 +54,9 @@ int resolve_libc_funcs() {
     ok += pick(g_libc.recvfrom,    "recvfrom");
     ok += pick(g_libc.read,        "read");
     ok += pick(g_libc.readv,       "readv");
-    ok += pick(g_libc.dlopen,      "dlopen");
 
     g_resolved.store(true);
-    LOGI("libc_funcs: resolved %d/12 symbols", ok);
+    LOGI("libc_funcs: resolved %d/11 symbols", ok);
     return ok;
 }
 
