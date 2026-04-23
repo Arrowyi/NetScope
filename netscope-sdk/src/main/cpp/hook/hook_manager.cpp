@@ -7,8 +7,8 @@
 #include "libc_funcs.h"
 #include "got_audit.h"
 #include "../netscope_log.h"
-#include "xhook.h"
-#include <android/dlext.h>
+#include "bytehook.h"
+
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -16,8 +16,6 @@
 #include <csetjmp>
 #include <cerrno>
 #include <mutex>
-#include <set>
-#include <string>
 
 namespace netscope {
 
@@ -31,11 +29,6 @@ static HookReport                g_report{};  // guarded by g_report_mutex
 static std::mutex                g_listener_mutex;
 static StatusListener            g_listener = nullptr;
 static void*                     g_listener_user = nullptr;
-
-static std::atomic<bool>         g_refresh_in_progress{false};
-
-static void* (*orig_dlopen)(const char*, int)                                         = nullptr;
-static void* (*orig_android_dlopen_ext)(const char*, int, const android_dlextinfo*)   = nullptr;
 
 // ─── Status / listener plumbing ─────────────────────────────────────────────
 
@@ -89,23 +82,24 @@ HookReport hook_manager_report() {
     return g_report;
 }
 
-// ─── SIGSEGV guard during refresh ───────────────────────────────────────────
+// ─── SIGSEGV guard around hook install ──────────────────────────────────────
 //
-// xhook writes to GOT pages via mprotect(). Rare vendor/RELRO layouts have
-// caused segfaults inside refresh in the wild. We install a SIGSEGV handler
-// that siglongjmp's out of the refresh window only — for all other threads
-// and times it chains back to the host app's original handler (Android's
-// signal_chain + tombstoned).
+// bytehook 1.1.1 has its own internal safety net, but we still wrap the
+// install phase in a belt-and-braces guard: if anything faults during the
+// initial install we siglongjmp out and flip to FAILED rather than
+// crashing the app. The guard is only active on the init thread, and only
+// during the narrow init window — once install is done we restore the
+// previous SIGSEGV handler.
 
-static thread_local sigjmp_buf     t_refresh_jmp;
-static thread_local bool           t_in_refresh = false;
+static thread_local sigjmp_buf     t_install_jmp;
+static thread_local bool           t_in_install = false;
 static struct sigaction            g_old_sigsegv{};
 static std::atomic<bool>           g_handler_installed{false};
 
 static void netscope_sigsegv(int sig, siginfo_t* info, void* ctx) {
-    if (t_in_refresh) {
-        t_in_refresh = false;
-        siglongjmp(t_refresh_jmp, 1);
+    if (t_in_install) {
+        t_in_install = false;
+        siglongjmp(t_install_jmp, 1);
     }
     // Not our problem — chain to whatever the app had before us.
     if (g_old_sigsegv.sa_flags & SA_SIGINFO) {
@@ -132,7 +126,7 @@ static void install_sigsegv_guard() {
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGSEGV, &sa, &g_old_sigsegv) != 0) {
-        LOGW("hook_manager: sigaction(SIGSEGV) failed errno=%d, no crash guard", errno);
+        LOGW("hook_manager: sigaction(SIGSEGV) failed errno=%d, no install guard", errno);
         g_handler_installed.store(false);
     } else {
         LOGI("hook_manager: SIGSEGV guard installed, old handler=%p",
@@ -140,103 +134,55 @@ static void install_sigsegv_guard() {
     }
 }
 
-// ─── APK-embedded .so detection ─────────────────────────────────────────────
+// ─── bytehook init ──────────────────────────────────────────────────────────
 //
-// Background: when the host APK is built with android:extractNativeLibs="false",
-// bionic's linker maps native libraries directly out of base.apk as a set of
-// PT_LOAD segments. /proc/self/maps reports synthesized paths like
-//   /data/app/<pkg>-<hash>/base.apk!/lib/arm64-v8a/libX.so
-// xhook 1.2.0's ELF parser mis-computes GOT addresses for this layout on some
-// OEM ROMs (HONOR Android 10 is a confirmed repro) — it writes our stub
-// pointers into rw-p heap pages that sit NEAR, not AT, the intended GOT
-// slot. A perfectly clean post-install audit results (slots_corrupt=0),
-// because the audit scans the set of GOTs we *intended* to patch, not the
-// set xhook *actually* wrote to. Minutes later, when the host app reads
-// one of those clobbered heap words back as a vtable pointer, it crashes
-// with pc == x8 in [anon:libc_malloc].
+// We use MANUAL mode deliberately. See docs/HOOK_EVOLUTION.md §P8:
 //
-// We cannot fix xhook 1.2.0's internals (it's a prebuilt static library).
-// The next-best thing is to refuse to touch APK-embedded libraries
-// altogether. xhook_ignore(regex, nullptr) skips any library whose path
-// matches the regex during refresh, which is exactly what we need.
+//   - AUTOMATIC mode pre-allocates a shared PROT_EXEC trampoline page so
+//     BYTEHOOK_CALL_PREV() can chain into the previous function in a proxy.
+//     Strict-W^X kernels (some HONOR ROMs, several IVI head-units) refuse
+//     `mmap(PROT_EXEC)` and the process dies at init.
+//   - MANUAL mode skips the trampoline. Every proxy in NetScope calls the
+//     real libc entry point via `libc().<fn>()` (resolved through
+//     dlsym(RTLD_NEXT) at init), so we never need BYTEHOOK_CALL_PREV.
+//
+// If bytehook_init still fails we surface the numeric status code verbatim
+// in the failureReason string so the HMI side can tell W^X from any other
+// failure (INITERR_TRAMPO=8, INITERR_HUB=27 are the two W^X smoking guns).
 
-// Returns the count of distinct APK-embedded libraries currently mapped.
-static int count_apk_embedded_libs(std::set<std::string>* out_paths) {
-    FILE* fp = std::fopen("/proc/self/maps", "re");
-    if (!fp) return 0;
-    std::set<std::string> seen;
-    char line[512];
-    while (std::fgets(line, sizeof(line), fp)) {
-        // Each maps line ends with an optional path. We only need the path.
-        char* bang = std::strstr(line, ".apk!/");
-        if (!bang) continue;
-        char* start = std::strrchr(line, ' ');
-        if (!start) continue;
-        ++start;
-        char* end = std::strchr(start, '\n');
-        if (end) *end = '\0';
-        // Only count once per distinct library path.
-        seen.emplace(start);
+static const char* bytehook_init_status_name(int code) {
+    switch (code) {
+        case BYTEHOOK_STATUS_CODE_OK:                return "OK";
+        case BYTEHOOK_STATUS_CODE_INITERR_INVALID_ARG: return "INITERR_INVALID_ARG";
+        case BYTEHOOK_STATUS_CODE_INITERR_SYM:       return "INITERR_SYM";
+        case BYTEHOOK_STATUS_CODE_INITERR_TASK:      return "INITERR_TASK";
+        case BYTEHOOK_STATUS_CODE_INITERR_HOOK:      return "INITERR_HOOK";
+        case BYTEHOOK_STATUS_CODE_INITERR_ELF:       return "INITERR_ELF";
+        case BYTEHOOK_STATUS_CODE_INITERR_ELF_REFR:  return "INITERR_ELF_REFR";
+        case BYTEHOOK_STATUS_CODE_INITERR_TRAMPO:    return "INITERR_TRAMPO (W^X?)";
+        case BYTEHOOK_STATUS_CODE_INITERR_SIG:       return "INITERR_SIG";
+        case BYTEHOOK_STATUS_CODE_INITERR_DLMTR:     return "INITERR_DLMTR";
+        case BYTEHOOK_STATUS_CODE_INITERR_CFI:       return "INITERR_CFI";
+        case BYTEHOOK_STATUS_CODE_INITERR_SAFE:      return "INITERR_SAFE";
+        case BYTEHOOK_STATUS_CODE_INITERR_HUB:       return "INITERR_HUB (W^X?)";
+        default:                                     return "unknown";
     }
-    std::fclose(fp);
-    if (out_paths) *out_paths = std::move(seen);
-    return static_cast<int>(out_paths ? out_paths->size() : seen.size());
 }
 
-static bool path_is_apk_embedded(const char* p) {
-    return p && std::strstr(p, ".apk!/") != nullptr;
-}
+static int init_bytehook_once() {
+    static std::atomic<int>  s_done{0};    // 0=not tried, 1=ok, 2=failed
+    static std::atomic<int>  s_last_rc{BYTEHOOK_STATUS_CODE_UNINIT};
+    int prev = s_done.load();
+    if (prev == 1) return BYTEHOOK_STATUS_CODE_OK;
+    if (prev == 2) return s_last_rc.load();
 
-// ─── dlopen hooks ───────────────────────────────────────────────────────────
-// Cover libraries loaded after init. Guarded by SIGSEGV handler above.
-
-static void refresh_hooks_for_new_lib(const char* filename) {
-    // If the initial post-install audit already flipped us to FAILED we
-    // MUST NOT call xhook_refresh again — every refresh on this ROM can
-    // corrupt more heap memory (see audit logic in hook_manager_init).
-    if (g_status.load() == HOOK_STATUS_FAILED) return;
-
-    // Defense in depth: even though we register xhook_ignore(".apk!/...") at
-    // init, also refuse to trigger a refresh when an APK-embedded library is
-    // the cause of the refresh. This skips the entire xhook_refresh() traversal
-    // for such dlopens, which is safer than relying on xhook's ignore pass.
-    if (path_is_apk_embedded(filename)) {
-        LOGD("hook_manager: '%s' is APK-embedded — skipping refresh to avoid "
-             "xhook 1.2.0 GOT miscomputation",
-             filename);
-        return;
-    }
-
-    if (g_refresh_in_progress.exchange(true)) return;
-    LOGD("hook_manager: '%s' loaded, refreshing GOT hooks",
-         filename ? filename : "(null)");
-
-    t_in_refresh = true;
-    if (sigsetjmp(t_refresh_jmp, 1) == 0) {
-        xhook_refresh(0);
-    } else {
-        LOGE("hook_manager: SIGSEGV during xhook_refresh for '%s' — flipping to DEGRADED",
-             filename ? filename : "(null)");
-        set_status(HOOK_STATUS_DEGRADED, "SIGSEGV during dlopen-triggered xhook_refresh");
-    }
-    t_in_refresh = false;
-    g_refresh_in_progress.store(false);
-}
-
-static void* hook_dlopen(const char* filename, int flags) {
-    void* handle = orig_dlopen ? orig_dlopen(filename, flags)
-                               : (libc().dlopen ? libc().dlopen(filename, flags) : nullptr);
-    if (handle) refresh_hooks_for_new_lib(filename);
-    return handle;
-}
-
-static void* hook_android_dlopen_ext(const char* filename, int flags,
-                                      const android_dlextinfo* info) {
-    void* handle = orig_android_dlopen_ext
-                   ? orig_android_dlopen_ext(filename, flags, info)
-                   : nullptr;
-    if (handle) refresh_hooks_for_new_lib(filename);
-    return handle;
+    int rc = bytehook_init(BYTEHOOK_MODE_MANUAL, /*debug=*/false);
+    s_last_rc.store(rc);
+    s_done.store(rc == BYTEHOOK_STATUS_CODE_OK ? 1 : 2);
+    LOGI("hook_manager: bytehook_init(MANUAL, debug=false) = %d (%s), ver=%s",
+         rc, bytehook_init_status_name(rc),
+         bytehook_get_version() ? bytehook_get_version() : "?");
+    return rc;
 }
 
 // ─── init / destroy ─────────────────────────────────────────────────────────
@@ -248,47 +194,11 @@ int hook_manager_init() {
         g_report = HookReport{};
     }
 
-    // Don't patch our own PLT — calls from libnetscope.so go straight to libc.
-    xhook_ignore("libnetscope\\.so$", nullptr);
-
-    // Block APK-embedded .so files unconditionally. On some OEM ROMs
-    // (confirmed: HONOR Android 10 + extractNativeLibs=false) xhook 1.2.0's
-    // ELF parser mis-computes the GOT VA for the base.apk!/lib/... synthesized
-    // paths, causing stub pointers to land in unrelated rw-p heap pages and
-    // crashing the host app with pc == x8 in [anon:libc_malloc] minutes later,
-    // usually on the first native HTTP call. We can't fix xhook here; the
-    // only safe option is to refuse to touch these libraries.
-    //
-    // Regex covers both classic bionic syntax (base.apk!/lib/abi/libX.so)
-    // and the rarer suffix-less variant.
-    xhook_ignore(".*\\.apk!/.*\\.so$", nullptr);
-    xhook_ignore(".*\\.apk$",          nullptr);
-
-    // Log which libraries are being skipped so the field report is actionable.
-    std::set<std::string> skipped_paths;
-    int apk_embedded = count_apk_embedded_libs(&skipped_paths);
-    if (apk_embedded > 0) {
-        LOGW("hook_manager: detected %d APK-embedded .so file(s); xhook_ignore "
-             "applied. Host traffic from these libraries will NOT be tracked. "
-             "Integrator should set android:extractNativeLibs=\"true\" in "
-             "AndroidManifest.xml for full coverage.", apk_embedded);
-        // Cap log volume but surface a few sample paths.
-        int dumped = 0;
-        for (const auto& p : skipped_paths) {
-            LOGW("hook_manager:   skipped: %s", p.c_str());
-            if (++dumped >= 8) break;
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_report_mutex);
-        g_report.apk_embedded_libs_skipped = apk_embedded;
-    }
-
-    // Resolve real libc entry points via dlsym. We call these directly from
-    // every hook handler instead of xhook's `orig_*`, which avoids chaining
-    // into any pre-existing third-party hook trampoline.
+    // Resolve real libc entry points via dlsym(RTLD_NEXT). We call these
+    // directly from every hook handler instead of chaining through the
+    // hooker's "prev" — see docs/HOOK_EVOLUTION.md §P2.
     int libc_ok = resolve_libc_funcs();
-    const bool libc_complete = (libc_ok >= 11);  // 11 networking + 1 dlopen
+    const bool libc_complete = (libc_ok >= 11);  // 11 networking + 1 dlopen (we don't use dlopen hooks with bytehook but resolve_libc_funcs still counts it)
     {
         std::lock_guard<std::mutex> lock(g_report_mutex);
         g_report.libc_resolved = libc_complete;
@@ -299,21 +209,52 @@ int hook_manager_init() {
         return -1;
     }
 
-    // Install SIGSEGV guard BEFORE xhook_refresh so we can recover if the
-    // initial refresh hits a bad library.
+    // Install SIGSEGV guard BEFORE bytehook_init so any early fault from a
+    // pathological loaded library is survivable.
     install_sigsegv_guard();
 
-    // xhook 1.2.0 ships its own best-effort SIGSEGV handler around GOT
-    // mprotect/write. It's cheap and independent from our own guard — turn
-    // it on so at least xhook can skip problem libs before our handler
-    // would see the signal.
-    xhook_enable_sigsegv_protection(1);
+    // Initialise bytehook. Strongly expected to succeed on non-W^X ROMs.
+    int bhrc = init_bytehook_once();
+    if (bhrc != BYTEHOOK_STATUS_CODE_OK) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "bytehook_init returned %d (%s) — check W^X policy / kernel mmap",
+                      bhrc, bytehook_init_status_name(bhrc));
+        set_status(HOOK_STATUS_FAILED, buf);
+        return -2;
+    }
 
-    // Register hooks (patterns only; xhook_refresh below applies them).
-    int fail_connect    = install_hook_connect();
-    int fail_dns        = install_hook_dns();
-    int fail_send_recv  = install_hook_send_recv();
-    int fail_close      = install_hook_close();
+    // Don't patch our own libraries' PLT — calls originating inside
+    // libnetscope.so go to libc directly. Also ignore libbytehook.so so
+    // bytehook never tries to hook itself.
+    bytehook_add_ignore("libnetscope.so");
+    bytehook_add_ignore("libbytehook.so");
+
+    // Register hooks. Each install_hook_*() ends up calling register_stub()
+    // (hook_stubs.cpp), which in turn calls bytehook_hook_all(). Bytehook
+    // applies each hook immediately and also arranges to re-apply it to
+    // libraries that get dlopen'd later, so we don't need our own dlopen
+    // interception anymore (unlike the xhook era).
+    int fail_connect   = 0;
+    int fail_dns       = 0;
+    int fail_send_recv = 0;
+    int fail_close     = 0;
+
+    t_in_install = true;
+    if (sigsetjmp(t_install_jmp, 1) == 0) {
+        fail_connect   = install_hook_connect();
+        fail_dns       = install_hook_dns();
+        fail_send_recv = install_hook_send_recv();
+        fail_close     = install_hook_close();
+    } else {
+        LOGE("hook_manager_init: SIGSEGV during install — rolling back");
+        t_in_install = false;
+        unhook_all_stubs();
+        set_status(HOOK_STATUS_FAILED,
+                   "SIGSEGV during bytehook_hook_all (possible W^X or vendor-lib GOT layout issue)");
+        return -3;
+    }
+    t_in_install = false;
 
     {
         std::lock_guard<std::mutex> lock(g_report_mutex);
@@ -321,35 +262,9 @@ int hook_manager_init() {
         g_report.dns_ok        = (fail_dns       == 0);
         g_report.send_recv_ok  = (fail_send_recv == 0);
         g_report.close_ok      = (fail_close     == 0);
-    }
-
-    // dlopen hooks to cover runtime-loaded libraries.
-    register_stub(".*\\.so$", "dlopen",
-                  (void*)hook_dlopen, (void**)&orig_dlopen);
-    register_stub(".*\\.so$", "android_dlopen_ext",
-                  (void*)hook_android_dlopen_ext, (void**)&orig_android_dlopen_ext);
-
-    // Apply all registered hooks. Guarded by SIGSEGV handler — if xhook
-    // crashes on a weird lib we land in the else branch and roll back.
-    int refresh_ret = 0;
-    t_in_refresh = true;
-    if (sigsetjmp(t_refresh_jmp, 1) == 0) {
-        refresh_ret = xhook_refresh(0);
-    } else {
-        LOGE("hook_manager_init: SIGSEGV during xhook_refresh — rolling back");
-        xhook_clear();
-        t_in_refresh = false;
-        set_status(HOOK_STATUS_FAILED,
-                   "SIGSEGV during xhook_refresh (likely a vendor lib with incompatible GOT layout)");
-        return -2;
-    }
-    t_in_refresh = false;
-    if (refresh_ret != 0) {
-        LOGE("hook_manager_init: xhook_refresh failed ret=%d", refresh_ret);
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "xhook_refresh returned %d", refresh_ret);
-        set_status(HOOK_STATUS_FAILED, buf);
-        return refresh_ret;
+        // Kept for HMI backwards compatibility. Bytehook handles
+        // APK-embedded libraries correctly, so this is always 0 now.
+        g_report.apk_embedded_libs_skipped = 0;
     }
 
     verify_hook_connect();
@@ -359,29 +274,21 @@ int hook_manager_init() {
 
     // ── Post-install audit ─────────────────────────────────────────────────
     //
-    // The authoritative question is: "For each .so that was supposed to be
-    // patched, does its GOT slot for connect/send/recv/... now hold one of
-    // our registered stub pointers, or does it point into some data page
-    // that would crash on call?"
+    // Same authoritative question as before, now for bytehook: for each .so
+    // that was supposed to be patched, does its GOT slot for connect/send/
+    // recv/... point to one of our registered stub pointers, or does it
+    // point into some data page that would crash on call?
     //
-    // We walk every loaded .so's PLT relocations ourselves via
-    // dl_iterate_phdr and read the real current GOT values back:
-    //   - audit_slots_hooked   value exactly matches a stub we passed to
-    //                          xhook_register — correct
-    //   - audit_slots_unhooked value still equals real libc — benign
-    //                          (lib excluded or loaded too late)
-    //   - audit_slots_chained  value is inside another library's .text —
-    //                          another hooker got there first
-    //   - audit_slots_corrupt  value is in rw-p data / unmapped memory —
-    //                          xhook misrouted the write; will crash
+    //   audit_slots_hooked    value exactly matches a stub we registered
+    //                         — correct
+    //   audit_slots_unhooked  value still equals real libc — benign (lib
+    //                         excluded or loaded too late)
+    //   audit_slots_chained   value is inside another library's .text —
+    //                         another hooker got there first
+    //   audit_slots_corrupt   value is in rw-p data / unmapped memory —
+    //                         hooker misrouted the write; would crash
     //
-    // The heap scan (audit_heap_stub_hits) is advisory only. xhook's own
-    // bookkeeping (xh_core_hook_info_t list) legitimately stores copies of
-    // our stub pointers in [anon:libc_malloc]; the bionic signal-handler
-    // table stores our SIGSEGV guard address; etc. Those matches are
-    // expected, so we never roll back based on heap-scan results.
-    //
-    // Only audit_slots_corrupt > 0 triggers rollback+FAILED.
+    // heap_stub_hits is advisory only (see §P4 in HOOK_EVOLUTION).
     GotAuditResult audit = audit_got(/*scan_anon_heap=*/true);
     {
         std::lock_guard<std::mutex> lock(g_report_mutex);
@@ -398,13 +305,7 @@ int hook_manager_init() {
              "memory — rolling back. first=%s",
              audit.slots_corrupt,
              audit.first_detail[0] ? audit.first_detail : "(none)");
-        // Undo whatever xhook wrote (including any wrong writes), then
-        // clear our registrations so dlopen-driven refreshes stop.
-        xhook_clear();
-        t_in_refresh = true;
-        if (sigsetjmp(t_refresh_jmp, 1) == 0) xhook_refresh(0);
-        t_in_refresh = false;
-
+        unhook_all_stubs();
         char buf[256];
         std::snprintf(buf, sizeof(buf),
                       "post-install audit: %s (corrupt_slots=%d)",
@@ -412,51 +313,34 @@ int hook_manager_init() {
                                             : "GOT slot points to non-executable memory",
                       audit.slots_corrupt);
         set_status(HOOK_STATUS_FAILED, buf);
-        return -3;
+        return -4;
     }
 
     if (audit.anon_stub_hits > 0) {
-        // Informational. These are legitimate references (xhook registry,
-        // signal handler table, soinfo copies) — NOT a crash risk given
-        // that the real GOT audit came up clean.
         LOGI("hook_manager_init: heap scan saw %d stub refs in bookkeeping "
-             "structures (xhook registry / sigaction / soinfo); GOT is clean",
+             "structures (hooker registry / sigaction / soinfo); GOT is clean",
              audit.anon_stub_hits);
     }
 
     const int total_failures = fail_connect + fail_dns + fail_send_recv + fail_close;
     const bool hooks_ok = (total_failures == 0) && libc_complete && (audit.slots_to_our_stub > 0);
 
-    if (hooks_ok && apk_embedded == 0) {
+    if (hooks_ok) {
         set_status(HOOK_STATUS_ACTIVE);
         LOGI("hook_manager_init: ACTIVE (audit: %d/%d slots hooked, %d libc, %d chained)",
              audit.slots_to_our_stub, audit.slots_total,
              audit.slots_to_real_libc, audit.slots_to_other_text);
-    } else if (hooks_ok && apk_embedded > 0) {
-        // Hooks themselves installed cleanly, but we *chose* to skip some
-        // APK-embedded libraries. Flag this as DEGRADED so the HMI can
-        // explain the partial coverage to the user.
-        char buf[256];
-        std::snprintf(buf, sizeof(buf),
-                      "skipped %d APK-embedded .so file(s) to avoid xhook 1.2.0 "
-                      "GOT miscomputation; set extractNativeLibs=\"true\" for "
-                      "full coverage (audit hooked=%d/%d slots)",
-                      apk_embedded,
-                      audit.slots_to_our_stub, audit.slots_total);
-        set_status(HOOK_STATUS_DEGRADED, buf);
-        LOGW("hook_manager_init: DEGRADED — %s", buf);
     } else {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
                       "partial hooks: connect=%s dns=%s send_recv=%s close=%s libc=%d/12 "
-                      "audit slots=%d hooked=%d apk-embedded-skipped=%d",
+                      "audit slots=%d hooked=%d",
                       fail_connect   ? "FAIL" : "ok",
                       fail_dns       ? "FAIL" : "ok",
                       fail_send_recv ? "FAIL" : "ok",
                       fail_close     ? "FAIL" : "ok",
                       libc_ok,
-                      audit.slots_total, audit.slots_to_our_stub,
-                      apk_embedded);
+                      audit.slots_total, audit.slots_to_our_stub);
         set_status(HOOK_STATUS_DEGRADED, buf);
         LOGW("hook_manager_init: %s", buf);
     }
@@ -464,11 +348,8 @@ int hook_manager_init() {
 }
 
 void hook_manager_destroy() {
-    LOGI("hook_manager_destroy: clearing hooks");
-    xhook_clear();
-    t_in_refresh = true;
-    if (sigsetjmp(t_refresh_jmp, 1) == 0) xhook_refresh(0);
-    t_in_refresh = false;
+    LOGI("hook_manager_destroy: unhooking all stubs");
+    unhook_all_stubs();
     set_status(HOOK_STATUS_NOT_INITIALIZED);
     LOGI("hook_manager_destroy: done");
 }

@@ -1,13 +1,18 @@
 cmake_minimum_required(VERSION 3.22.1)
 project("netscope")
 
-# xhook: pure GOT/PLT patcher, no mmap(PROT_EXEC), no trampolines.
-# Links statically into libnetscope.so — no extra .so shipped to consumers.
-add_library(xhook STATIC IMPORTED)
-set_target_properties(xhook PROPERTIES
-    IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xhook/libs/${ANDROID_ABI}/libxhook.a
-    INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xhook/include
-)
+# Hook backend: bytehook 1.1.1 (com.bytedance:bytehook, distributed as a
+# Prefab package via the Android Gradle dependency). Bytehook is a pure
+# PLT/GOT patcher; our proxies never call BYTEHOOK_CALL_PREV, so bytehook
+# operates without installing a PROT_EXEC trampoline for the prev chain.
+# This keeps NetScope W^X-compatible on locked-down ROMs.
+#
+# History & migration rationale: docs/HOOK_EVOLUTION.md
+#
+# The previous xhook 1.2.0 static library is kept under third_party/xhook/
+# but NOT linked — it remains only as a quick revert path if bytehook
+# proves unusable on a specific OEM device.
+find_package(bytehook REQUIRED CONFIG)
 
 add_library(netscope SHARED
     netscope_jni.cpp
@@ -29,7 +34,7 @@ add_library(netscope SHARED
 target_include_directories(netscope PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(netscope
-    xhook
+    bytehook::bytehook
     log
     android
 )

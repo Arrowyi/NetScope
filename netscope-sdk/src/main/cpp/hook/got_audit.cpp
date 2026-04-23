@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include <csetjmp>
+#include <csignal>
 #include <dlfcn.h>
 #include <link.h>
 #include <elf.h>
@@ -69,10 +71,10 @@ static void ensure_netscope_text() {
     }
 }
 
-// Value exactly matches one of the `new_func` pointers we passed to
-// xhook_register. This is the ONLY correct definition of "our stub" —
-// earlier builds used a range check over libnetscope.so's .text segment
-// and produced lots of false positives (xhook's own internal registry
+// Value exactly matches one of the `new_func` pointers we passed to the
+// hooker. This is the ONLY correct definition of "our stub" — earlier
+// builds used a range check over libnetscope.so's .text segment and
+// produced lots of false positives (the hooker's own internal registry
 // legitimately stores these addresses in heap pages, as does bionic's
 // sigaction table for our SEGV guard).
 static bool is_our_stub(uintptr_t v) {
@@ -149,14 +151,42 @@ static const MapRegion* find_region(const std::vector<MapRegion>& maps, uintptr_
 
 static bool is_executable(const MapRegion* r) { return r && r->perms[2] == 'x'; }
 
+// STRICT whitelist: only the regions where stub-copies from a *correct* hooker
+// write are known to land. On modern Android (Q+/R+), the kernel maps many
+// anonymous VA ranges whose contents are NOT all backed by physical memory:
+//
+//   [anon:scudo_primary] / [anon:scudo_secondary]        ← guard pages: SEGV_MAPERR on read
+//   [anon:scs:...]  (ShadowCallStack)                    ← thread-local, racy
+//   [anon:cfi shadow]                                    ← sparse
+//   [anon:dalvik-*]                                      ← ART heap, may unmap
+//   [anon:.bss] / unnamed anon                           ← unknown contents
+//
+// Scanning any of these risks exactly the crash we saw in `6f50453` where
+// audit_got stepped off the tail of an [anon:scudo_*] reservation.
+// Restrict to the two names that are unambiguously the process heap.
 static bool is_rw_anon_heap(const MapRegion& r) {
     if (r.perms[0] != 'r' || r.perms[1] != 'w') return false;
     if (r.perms[2] == 'x') return false;
-    if (r.path.empty()) return true;
-    if (r.path.find("[anon:libc_malloc") != std::string::npos) return true;
-    if (r.path.find("[anon:scudo")      != std::string::npos) return true;
     if (r.path == "[heap]") return true;
+    if (r.path == "[anon:libc_malloc]") return true;
     return false;
+}
+
+// ─── SIGSEGV-guarded scan (belt and braces) ─────────────────────────────────
+//
+// Even with the strict whitelist above, a region tagged as [anon:libc_malloc]
+// can in principle have partially-unmapped tails (bionic sometimes carves
+// them out). Any page-fault inside our scan hops through this setjmp so we
+// skip the offending region without killing the process.
+
+namespace {
+thread_local sigjmp_buf t_scan_jmp;
+thread_local int        t_scan_active = 0;
+}
+
+static void scan_sigsegv_handler(int sig, siginfo_t*, void*) {
+    if (t_scan_active) siglongjmp(t_scan_jmp, sig);
+    _exit(128 + sig); // not ours — terminate to avoid masking real bugs
 }
 
 // ─── PT_DYNAMIC walk ────────────────────────────────────────────────────────
@@ -314,16 +344,14 @@ static int audit_cb(struct dl_phdr_info* info, size_t, void* data) {
 
 // ─── Optional heap scan ─────────────────────────────────────────────────────
 //
-// For each rw-p anonymous region, look for bytes that equal one of our
-// stub addresses. If we find any, xhook wrote into the heap and the host
-// app is about to crash the moment that object is used as a function
-// pointer / vtable.
-
-// Sweep rw-p anonymous regions for exact copies of our registered stub
-// pointers. This is a DIAGNOSTIC — not a correctness check. Legitimate
-// references abound:
-//   - xhook's own xh_core_hook_info_t linked list stores every new_func
-//     we passed to xhook_register()
+// For strictly-named heap regions ([anon:libc_malloc], [heap]), look for
+// bytes that equal one of our stub addresses. If we find any, the hooker
+// has written into an unrelated heap object and the host app is about to
+// crash the moment that object is used as a function pointer / vtable.
+//
+// This is a DIAGNOSTIC — not a correctness check. Legitimate references
+// abound:
+//   - the hooker's own registry stores every new_func we passed in
 //   - bionic's sigaction() handler table stores our SIGSEGV guard
 //   - soinfo / dl_phdr_info may store libnetscope.dlpi_addr
 // A nonzero hit count WITH a clean slots_corrupt scan means "everything
@@ -333,12 +361,37 @@ static void scan_anon_for_stubs(AuditCtx* ctx) {
     constexpr size_t kMaxScanBytes = 256ULL * 1024 * 1024;
     constexpr int    kMaxLoggedHits = 8;   // keep log volume low
     constexpr int    kMaxHits       = 64;  // stop counting after this
+
+    // Install a SIGSEGV handler so a page-fault inside the scan hops to our
+    // setjmp target rather than crashing the app. This was the proximate
+    // cause of the `6f50453` audit_got self-crash.
+    struct sigaction new_sa{};
+    new_sa.sa_flags = SA_SIGINFO;
+    new_sa.sa_sigaction = scan_sigsegv_handler;
+    sigemptyset(&new_sa.sa_mask);
+    struct sigaction old_sa{};
+    bool guard_installed = (sigaction(SIGSEGV, &new_sa, &old_sa) == 0);
+
     size_t budget = kMaxScanBytes;
     for (const auto& r : *ctx->maps) {
         if (budget == 0) break;
         if (!is_rw_anon_heap(r)) continue;
         size_t span = r.end - r.start;
         size_t take = span < budget ? span : budget;
+
+        if (guard_installed) {
+            t_scan_active = 1;
+            if (sigsetjmp(t_scan_jmp, 1) != 0) {
+                // We just unwound from a SIGSEGV inside the loop below —
+                // the region was unsafe to dereference. Skip it entirely.
+                t_scan_active = 0;
+                LOGW("got_audit: SIGSEGV inside '%s' @ [%p, %p) — skipping region",
+                     r.path.empty() ? "(anon)" : r.path.c_str(),
+                     (void*)r.start, (void*)(r.start + take));
+                continue;
+            }
+        }
+
         budget -= take;
         ctx->result.anon_regions_scanned++;
         ctx->result.anon_bytes_scanned += take;
@@ -353,7 +406,7 @@ static void scan_anon_for_stubs(AuditCtx* ctx) {
             if (ctx->result.anon_stub_hits <= kMaxLoggedHits) {
                 uintptr_t at = r.start + i * sizeof(uintptr_t);
                 LOGI("got_audit: stub %p at %p in '%s' "
-                     "(likely xhook registry / sigaction table / soinfo copy)",
+                     "(likely hooker registry / sigaction table / soinfo copy)",
                      (void*)v, (void*)at,
                      r.path.empty() ? "(anon)" : r.path.c_str());
                 if (ctx->result.anon_stub_hits == 1) {
@@ -362,9 +415,13 @@ static void scan_anon_for_stubs(AuditCtx* ctx) {
                                 r.path.empty() ? "(anon)" : r.path.c_str());
                 }
             }
-            if (ctx->result.anon_stub_hits >= kMaxHits) return;
+            if (ctx->result.anon_stub_hits >= kMaxHits) goto done;
         }
+        t_scan_active = 0;
     }
+done:
+    t_scan_active = 0;
+    if (guard_installed) sigaction(SIGSEGV, &old_sa, nullptr);
 }
 
 // ─── Public entry point ─────────────────────────────────────────────────────
@@ -372,8 +429,8 @@ static void scan_anon_for_stubs(AuditCtx* ctx) {
 GotAuditResult audit_got(bool scan_anon_heap) {
     ensure_netscope_text();
 
-    // Sanity: how many distinct stubs did we register with xhook? The
-    // audit's "hooked vs corrupt" decision only works if this is nonzero.
+    // Sanity: how many distinct stubs did we register? The audit's
+    // "hooked vs corrupt" decision only works if this is nonzero.
     {
         void* stubs[32];
         size_t n = registered_stubs_snapshot(stubs, 32);

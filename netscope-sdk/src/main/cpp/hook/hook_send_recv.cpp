@@ -1,10 +1,12 @@
 // Hooks send/recv/write/read/writev/readv/sendto/recvfrom in ALL loaded libraries via GOT/PLT.
 //
-// WHY xhook (pure GOT patcher):
-//   xhook_register(".*\\.so$", sym, ...) patches the GOT entry in every loaded .so
-//   including libconscrypt_jni.so (Java HTTPS) and any NDK native library.
-//   It uses mprotect() to temporarily make the GOT page writable, then restores it.
-//   Zero mmap(PROT_EXEC), zero trampolines — W^X-safe on all Android versions.
+// WHY pure GOT patching (bytehook in MANUAL mode):
+//   bytehook_hook_all("libc.so", sym, ...) patches the GOT entry in every
+//   loaded .so including libconscrypt_jni.so (Java HTTPS) and any NDK
+//   native library. It uses mprotect() to temporarily make the GOT page
+//   writable, then restores it. In MANUAL mode bytehook doesn't call
+//   BYTEHOOK_CALL_PREV anywhere, so no shared PROT_EXEC trampoline is
+//   allocated — W^X-safe on all Android versions.
 //
 // NO DOUBLE-COUNTING:
 //   Each call site's GOT is patched exactly once. A send() from libconscrypt_jni.so
@@ -31,8 +33,10 @@
 namespace netscope {
 
 // See libc_funcs.h — all calls to the real libc go through libc().* which is
-// resolved via dlsym at init time. This bypasses xhook's `orig_*` chain and
-// prevents crashes when the host app has also hooked these symbols.
+// resolved via dlsym at init time. We deliberately do NOT use the hooker's
+// "prev" pointer (bytehook's BYTEHOOK_CALL_PREV), which would chain through
+// whatever hook the host app installed first and can crash if that hook's
+// private state is stale. See docs/HOOK_EVOLUTION.md §P2.
 
 static void try_resolve_domain(int fd, const void* buf, size_t len) {
     if (FlowTable::instance().is_first_send_done(fd)) return;

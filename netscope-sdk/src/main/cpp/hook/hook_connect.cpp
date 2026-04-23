@@ -11,11 +11,12 @@
 
 namespace netscope {
 
-// NOTE: We intentionally do NOT use the xhook-saved `orig_*` here. See
-// libc_funcs.h for the rationale: calling xhook's `orig_*` can land inside
-// another hooker's trampoline (e.g., the host app's own native HTTP stack)
-// and crash. Instead we always call the dlsym-resolved real libc symbol.
-// We still register with xhook so our hook is installed into every GOT.
+// NOTE: We intentionally do NOT use the hooker's "prev" pointer here (e.g.
+// bytehook's BYTEHOOK_CALL_PREV). See libc_funcs.h: calling through any
+// previous hook can land inside another hooker's trampoline (e.g. the host
+// app's own native HTTP stack) and crash. Instead we always call the
+// dlsym-resolved real libc symbol. We still register with bytehook so our
+// proxy is installed into every caller's GOT.
 
 static int hook_connect(int sockfd, const struct sockaddr* addr, socklen_t addrlen) {
     auto real = libc().connect;
@@ -35,7 +36,8 @@ static int hook_connect(int sockfd, const struct sockaddr* addr, socklen_t addrl
 }
 
 int install_hook_connect() {
-    // `orig_*` out-param intentionally null — we don't rely on it.
+    // `pathname_regex` and `old_func` are ignored by hook_stubs under
+    // bytehook — kept for source compat. See hook_stubs.h.
     return register_stub(".*\\.so$", "connect", (void*)hook_connect, nullptr);
 }
 

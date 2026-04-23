@@ -15,13 +15,11 @@ enum HookStatus : int32_t {
 // Detailed report of which hooks succeeded. Used by the JNI bridge to build
 // a Kotlin HookReport data class.
 //
-// Fields after `close_ok` are populated by got_audit() after xhook_refresh
-// and let the upper layer distinguish "xhook accepted every register call"
-// from "xhook actually wrote the right pointer into the right GOT slot".
-// On some ROMs (notably HONOR Android 10 with extractNativeLibs=false)
-// xhook 1.2.0 mis-computes the GOT address for APK-embedded .so files and
-// ends up writing our stub pointer into a heap word, corrupting a random
-// C++ object. The post-install audit detects this and flips us to FAILED.
+// Fields after `close_ok` are populated by got_audit() after the hooker has
+// installed all stubs, and let the upper layer distinguish "bytehook
+// accepted every register call" from "bytehook actually wrote the right
+// pointer into the right GOT slot". See docs/HOOK_EVOLUTION.md for the
+// full backstory on why this audit exists.
 struct HookReport {
     HookStatus status;
     bool libc_resolved;        // all 12 libc symbols resolved via dlsym
@@ -36,15 +34,13 @@ struct HookReport {
     int  audit_slots_unhooked;     // pointing to real libc (lib not patched)
     int  audit_slots_chained;      // pointing to another lib's .text
     int  audit_slots_corrupt;      // pointing to rw-p data / unmapped (BAD)
-    int  audit_heap_stub_hits;     // stub addresses found in rw-p anon heap (BAD)
+    int  audit_heap_stub_hits;     // stub addresses found in rw-p anon heap (advisory)
 
-    // Number of APK-embedded .so files (paths like
-    // /data/app/.../base.apk!/lib/arm64-v8a/libX.so) that were
-    // INTENTIONALLY skipped because xhook 1.2.0 mis-computes their GOT
-    // addresses on some ROMs. When > 0 the SDK stays in DEGRADED: traffic
-    // from system libraries is still captured, but calls from those
-    // app-bundled native libraries go unnumbered. Integrator should set
-    // android:extractNativeLibs="true" to recover full coverage.
+    // Legacy field from the xhook era. On xhook 1.2.0 we had to skip
+    // APK-embedded .so files (base.apk!/...) because of a GOT miscompute
+    // bug. Bytehook handles those layouts correctly, so this is always
+    // zero now. Retained only for HMI backwards compatibility; safe to
+    // ignore in new integrations.
     int  apk_embedded_libs_skipped;
 
     // Short human-readable description of why the SDK is DEGRADED / FAILED.

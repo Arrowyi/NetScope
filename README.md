@@ -8,10 +8,11 @@ A lightweight Android SDK that monitors **all network traffic** in the embedding
 
 ## How It Works
 
-NetScope uses **pure GOT / PLT hooking** via [xhook](https://github.com/iqiyi/xHook) (statically linked into `libnetscope.so`, no extra `.so` shipped). Every loaded library's GOT entries for a handful of libc network functions are redirected through NetScope's counters.
+NetScope uses **pure GOT / PLT hooking** via [bytehook](https://github.com/bytedance/bhook) (battle-tested in TikTok / Douyin). Every loaded library's GOT entries for a handful of libc network functions are redirected through NetScope's counters.
 
-- **No trampolines, no `mmap(PROT_EXEC)`** → works on strict-W^X ROMs (HMS / HONOR / some Knox builds)
-- **Calls to the real libc go through `dlsym(RTLD_NEXT)` cached pointers** — never chains back into whatever hook the host app may have installed first (prevents the classic "`pc == x8`, fault addr in `[anon:libc_malloc]`" crash)
+- **MANUAL mode, no `BYTEHOOK_CALL_PREV` in proxies** → no shared PROT_EXEC trampoline, keeps NetScope W^X-compatible on locked-down ROMs (HMS / HONOR / Knox / IVI head-units)
+- **Calls to the real libc go through `dlsym(RTLD_NEXT)` cached pointers** — never chains back into whatever hook the host app (or a vendor libraty) may have installed first (prevents the classic "`pc == x8`, fault addr in `[anon:libc_malloc]`" crash)
+- **Handles `extractNativeLibs="false"`** — bytehook's ELF parser correctly resolves GOT addresses for libraries mapped directly out of `base.apk`, which `xhook 1.2.0` got wrong on some OEM ROMs. See [`docs/HOOK_EVOLUTION.md`](docs/HOOK_EVOLUTION.md) for the full backstory.
 - Domains are attributed via three signals:
   1. **TLS SNI** — parsed from the ClientHello plaintext
   2. **HTTP Host header** — read from plaintext HTTP
@@ -81,10 +82,12 @@ Download `netscope-sdk-release.aar` from [Releases](https://github.com/Arrowyi/N
 dependencies {
     implementation files('libs/netscope-sdk-release.aar')
     implementation 'androidx.annotation:annotation:1.7.1'
+    // Bytehook ships libbytehook.so, loaded at runtime by libnetscope.so.
+    // When you use the JitPack/Maven dependency above, this is pulled
+    // in automatically; with a local AAR you MUST add it explicitly.
+    implementation 'com.bytedance:bytehook:1.1.1'
 }
 ```
-
-NetScope has **no transitive native dependency** — xhook is statically linked into `libnetscope.so`.
 
 ## Quick Start
 
@@ -161,27 +164,27 @@ val report = NetScope.getHookReport()
 | Condition | Status |
 |---|---|
 | Everything installed cleanly and the post-install audit confirmed every GOT write went to a real GOT slot | `ACTIVE` |
-| One of the `xhook_register` calls failed but others succeeded | `DEGRADED` |
-| A runtime `dlopen` triggered an xhook refresh that crashed (rare, vendor-specific GOT layouts) — SDK rolled back, host app keeps running | `DEGRADED` |
-| `xhook_refresh` crashed during initial install → fully rolled back | `FAILED` |
+| One of the `install_hook_*` calls failed but others succeeded | `DEGRADED` |
+| `bytehook_init` failed (most commonly a W^X kernel refusing `mmap(PROT_EXEC)` — status code 8 `INITERR_TRAMPO` or 27 `INITERR_HUB`) | `FAILED` |
+| SIGSEGV during initial hook install → SDK rolled back, host app keeps running | `FAILED` |
 | A critical libc symbol (connect / send / recv / read) failed to resolve via dlsym | `FAILED` |
 | **Post-install audit detected GOT writes landing in non-executable memory** (`auditSlotsCorrupt > 0`, see below) | `FAILED` |
 
-When the status is `FAILED`, NetScope's hook handlers short-circuit and stop collecting data, future `dlopen`s no longer trigger `xhook_refresh` (to prevent further memory corruption), and your app's network calls continue to work as if NetScope weren't there.
+When the status is `FAILED`, NetScope's hook handlers short-circuit and stop collecting data, bytehook is told to unhook every stub it installed, and your app's network calls continue to work as if NetScope weren't there.
 
 ### Post-install GOT audit
 
-Right after `xhook_refresh()`, NetScope walks every loaded `.so` via `dl_iterate_phdr`, reads the actual GOT entry for each of the ~13 libc symbols we patch, and classifies what the GOT currently holds. A slot's value is matched **exactly** against the set of pointers we passed to `xhook_register()`:
+Right after the initial hook install, NetScope walks every loaded `.so` via `dl_iterate_phdr`, reads the actual GOT entry for each of the ~11 libc symbols we patch, and classifies what the GOT currently holds. A slot's value is matched **exactly** against the set of pointers we passed to `bytehook_hook_all()`:
 
 | Audit bucket | Meaning |
 |---|---|
 | `auditSlotsHooked`   | GOT value exactly equals a NetScope stub pointer — correct. |
 | `auditSlotsUnhooked` | GOT still holds the real libc pointer — that lib was excluded or loaded too late. Benign. |
 | `auditSlotsChained`  | GOT points into some other library's executable region — a third-party hooker got there first. Not a crash. |
-| `auditSlotsCorrupt`  | **GOT points into `rw-p` data / unmapped memory** — xhook wrote to a non-executable page and this slot would crash on call. **Forces `FAILED` + rollback.** |
-| `auditHeapStubHits`  | Advisory / diagnostic only. Counts how many copies of NetScope stub pointers are sitting inside rw-p anonymous memory. **This does NOT force `FAILED`** — legitimate copies are expected (xhook's own `xh_core_hook_info_t` registry, bionic's sigaction handler table, soinfo / dl_phdr_info snapshots). |
+| `auditSlotsCorrupt`  | **GOT points into `rw-p` data / unmapped memory** — the hooker wrote to a non-executable page and this slot would crash on call. **Forces `FAILED` + rollback.** |
+| `auditHeapStubHits`  | Advisory / diagnostic only. Counts how many copies of NetScope stub pointers are sitting inside `[anon:libc_malloc]` pages. **This does NOT force `FAILED`** — legitimate copies are expected (bytehook's internal registry, bionic's sigaction handler table, soinfo / dl_phdr_info snapshots). |
 
-Only `auditSlotsCorrupt > 0` triggers rollback. When it happens the audit calls `xhook_clear()` which writes pre-hook values back into every patched location; when the misrouted write hit heap memory that hasn't been read yet this typically undoes the damage before the host app crashes.
+Only `auditSlotsCorrupt > 0` triggers rollback. When it happens the audit calls `bytehook_unhook()` for every stub NetScope installed, restoring the pre-hook libc pointers into every GOT slot.
 
 ## API Reference
 
@@ -258,27 +261,23 @@ D NetScope: report raw interval=2 cumulative=3
 
 ## Why won't my host app crash this time?
 
-Earlier builds of NetScope relied on xhook's `orig_*` out-parameter to call "whatever function was in this GOT before we patched it". When the host app (or a third-party native library inside it — e.g. custom HTTP stacks, vendor telematics libs) had already installed its own hooks on `connect` / `send` / etc., that `orig_*` pointer landed inside the third party's trampoline, whose private state could be stale or freed, producing `SIGSEGV SEGV_ACCERR` with `pc == x8` pointing into `[anon:libc_malloc]`.
+Earlier builds of NetScope (xhook era) relied on the hooker's `orig_*` out-parameter to call "whatever function was in this GOT before we patched it". When the host app (or a third-party native library inside it — e.g. custom HTTP stacks, vendor telematics libs) had already installed its own hooks on `connect` / `send` / etc., that `orig_*` pointer landed inside the third party's trampoline, whose private state could be stale or freed, producing `SIGSEGV SEGV_ACCERR` with `pc == x8` pointing into `[anon:libc_malloc]`.
 
-NetScope now **always calls the real libc** via `dlsym(RTLD_NEXT)` cached pointers, so it no longer chains into any other hooker's trampoline. GOT patches still observe traffic, but the "call original" arrow short-circuits straight to libc.
+NetScope now **always calls the real libc** via `dlsym(RTLD_NEXT)` cached pointers, so it no longer chains into any other hooker's trampoline. GOT patches still observe traffic, but the "call original" arrow short-circuits straight to libc. We explicitly do **not** use `BYTEHOOK_CALL_PREV` in any proxy — that macro requires a shared trampoline page that strict-W^X kernels refuse.
 
-Additionally, `xhook_refresh` (both the initial install and any dlopen-triggered refresh) is wrapped in a thread-local `sigsetjmp` / `SIGSEGV` handler: if xhook ever segfaults on a pathological vendor library, NetScope rolls back, flips status to `FAILED`, and the host app keeps running. The `SIGSEGV` handler chains back to the host's original signal handler for any segfault that isn't ours, so you don't lose tombstones from genuine app crashes.
+Additionally, the initial hook install is wrapped in a thread-local `sigsetjmp` / `SIGSEGV` handler: if bytehook ever segfaults on a pathological vendor library, NetScope unhooks every stub it installed, flips status to `FAILED`, and the host app keeps running. The `SIGSEGV` handler chains back to the host's original signal handler for any segfault that isn't ours, so you don't lose tombstones from genuine app crashes.
+
+For the full evolution of the crash scenarios we've mitigated (shadowhook W^X → bhook W^X → xhook `orig_*` crash → xhook APK-embedded misroute → bytehook 1.1.1), read [`docs/HOOK_EVOLUTION.md`](docs/HOOK_EVOLUTION.md).
 
 ## Known Limitations
 
 ### Environmental
 
-- **`extractNativeLibs="false"` on some OEM ROMs** (confirmed on HONOR Android 10; similar behaviour suspected on Knox-derived builds): the bionic linker maps native libraries directly out of `base.apk` as multiple segments, each reporting a synthesized path like `/data/app/<pkg>-<hash>/base.apk!/lib/arm64-v8a/libX.so`. xhook 1.2.0's ELF parser mis-computes GOT addresses for this layout — it writes our stub pointers into rw-p anonymous heap pages that sit *near*, not *at*, the intended GOT slot. The initial post-install audit comes up perfectly clean (the slots we intended to patch are fine), but the clobbered heap words corrupt random C++ objects. Minutes later, when the host app dereferences one of them as a vtable pointer, the process crashes with `pc == x8` in `[anon:libc_malloc]`, typically on the first native HTTP call from an app-bundled .so.
-
-  **Current mitigation (automatic, shipped)**: NetScope registers `xhook_ignore(".*\\.apk!/.*\\.so$", nullptr)` *before* the first `xhook_refresh`. Every APK-embedded library is skipped outright — xhook never touches them, so it can never misroute a write. [HookReport.apkEmbeddedLibsSkipped](netscope-sdk/src/main/kotlin/indi/arrowyi/netscope/sdk/HookReport.kt) reports how many libraries were skipped; when > 0 the SDK stays in `Status.DEGRADED` with a `failureReason` naming the `extractNativeLibs=true` workaround.
-
-  Coverage impact: system libraries (`/system/lib64/*`, including `libssl`, `libcrypto`, `libconscrypt_jni` on most devices) are still fully hooked, so traffic originating from standard Java HTTP stacks (okhttp, HttpURLConnection, Conscrypt, WebView) is counted. Traffic from *app-bundled* native HTTP clients (custom `libcurl`-like stacks, game engines) is not counted.
-
-  Recovering full coverage:
-  - Set `android:extractNativeLibs="true"` in the host app's `AndroidManifest.xml` — the OS then extracts .so files onto disk at install time and the path contains no `!/`, so the xhook path is safe.
-  - Or wait for the in-progress bytehook / shadowhook 2.x migration; both handle APK-embedded layouts natively.
-
-  Note: `auditHeapStubHits > 0` on its own is **not** a failure. It's an advisory count of NetScope stub pointers observed inside heap pages. Legitimate copies are expected (xhook maintains an internal `xh_core_hook_info_t` registry that stores every `new_func` we passed it; bionic keeps our SIGSEGV guard in its sigaction table; the dynamic linker stores library load-base values in several places). The authoritative failure signal is `auditSlotsCorrupt > 0`.
+- **Locked-down W^X kernels** (some IVI head-units, certain Knox-derived ROMs): bytehook's internal initialisation may call `mmap(PROT_EXEC, ...)` for its dispatch hub. On kernels that enforce strict W^X this returns `EPERM` and `bytehook_init` returns a non-OK status code (`INITERR_TRAMPO=8` or `INITERR_HUB=27` are the two we've seen). NetScope surfaces this as `Status.FAILED` with the numeric code in `failureReason`, so the HMI can tell "W^X refusal" apart from any other failure. If you hit this, the current escape hatch is:
+  - Roll back to commit `6f50453` (xhook-based) for the affected device family, accepting reduced coverage under `extractNativeLibs="false"`.
+  - Or file an issue against NetScope with the `failureReason` text so we can evaluate writing our own minimal PLT patcher (≤ 300 LOC, feasible given we already parse ELF in `got_audit.cpp`).
+- **`extractNativeLibs="false"` on HONOR Android 10** (historical): xhook 1.2.0 mis-computed GOT addresses for `base.apk!/lib/...` layouts. Bytehook handles these correctly, so this limitation is no longer applicable.
+- `auditHeapStubHits > 0` on its own is **not** a failure. It's an advisory count of NetScope stub pointers observed inside `[anon:libc_malloc]` pages. Legitimate copies are expected (bytehook maintains an internal task registry; bionic keeps our SIGSEGV guard in its sigaction table; the dynamic linker stores library load-base values in several places). The authoritative failure signal is `auditSlotsCorrupt > 0`.
 
 ### Functional
 

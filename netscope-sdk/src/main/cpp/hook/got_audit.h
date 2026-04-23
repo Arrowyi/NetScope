@@ -2,35 +2,37 @@
 //
 // Post-install GOT audit.
 //
-// After xhook_refresh() completes, we walk every loaded shared object via
-// dl_iterate_phdr and read the actual GOT entry for every relocation whose
-// symbol matches one of NetScope's hooked functions (connect / send / recv /
-// …). Each slot's current value is classified:
+// After the hooker (currently bytehook 1.1.1) installs all stubs, we walk
+// every loaded shared object via dl_iterate_phdr and read the actual GOT
+// entry for every relocation whose symbol matches one of NetScope's hooked
+// functions (connect / send / recv / …). Each slot's current value is
+// classified:
 //
-//   stub       — points into libnetscope.so's executable segment. Good.
+//   stub       — exact match against one of NetScope's registered
+//                new_func pointers (see hook_stubs.h). Good.
 //   libc       — value still equals the real libc symbol we resolved via
-//                dlsym. Benign: that lib's GOT was never patched (e.g. lib
-//                matched xhook_ignore or was loaded too late).
+//                dlsym. Benign: that lib's GOT was never patched (e.g.
+//                bytehook_add_ignore matched it, or it was loaded too late).
 //   other-text — points into SOME other library's r-xp region. Another
 //                native hooker got there first; not our fault, not a crash
 //                risk for us.
 //   CORRUPT    — points into rw-p / r--p data or into no mapped region
-//                at all. This is the smoking gun for "xhook wrote the
-//                stub address into the wrong page" (a documented issue
-//                with xhook 1.2.0 when the APK is built with
-//                extractNativeLibs=false — the bionic linker reports
-//                path `base.apk!/lib/arm64-v8a/<name>.so` and xhook's
-//                ELF parsing can misalign on the segment layout).
+//                at all. Smoking gun for "the hooker wrote the stub
+//                address into the wrong page". This was a real issue
+//                under xhook 1.2.0 with extractNativeLibs=false; bytehook
+//                handles those layouts correctly, but we keep the audit
+//                as a safety net.
 //
-// Optionally (but by default on) the audit also linearly scans every
-// anonymous rw-p region looking for stray copies of our stub addresses.
-// If a stub pointer turns up inside [anon:libc_malloc], xhook definitely
-// wrote into some third-party heap object — and the host app will segfault
-// the moment that object is used (classic "pc == x8, fault in
-// [anon:libc_malloc]" pattern).
+// Optionally (but by default on) the audit also linearly scans [anon:libc_malloc]
+// regions looking for stray copies of our stub addresses. If a stub pointer
+// turns up inside the heap, the hooker has written into some third-party
+// object — the host app would segfault the moment that object is used.
+// See docs/HOOK_EVOLUTION.md §P4 for why this is advisory-only (legitimate
+// copies abound in the hooker's own registry / sigaction table / soinfo).
 //
 // Total cost: GOT walk is ~ms even on big apps; the heap scan is capped
-// at 256 MiB and finishes in hundreds of ms.
+// at 256 MiB, restricted to strictly-named [anon:libc_malloc] / [heap]
+// regions, and SIGSEGV-guarded so it can't crash the audit itself.
 
 #include <cstdint>
 #include <cstddef>
@@ -55,10 +57,9 @@ struct GotAuditResult {
     char first_detail[256]     = {};
 };
 
-// Run the audit. Safe to call exactly once after a successful xhook_refresh.
-// `scan_anon_heap`: if true, also sweep rw-p anonymous regions for stray
-// stub pointers (expensive but conclusive for the xhook-wrote-into-heap
-// bug).
+// Run the audit. Safe to call exactly once after hook installation.
+// `scan_anon_heap`: if true, also sweep strictly-named heap regions
+// ([anon:libc_malloc], [heap]) for stray stub pointers.
 GotAuditResult audit_got(bool scan_anon_heap);
 
 } // namespace netscope
