@@ -1,4 +1,25 @@
 jdk:
   - openjdk17
+
+# Unset JAVA_TOOL_OPTIONS before invoking Gradle.
+#
+# WHY: JitPack's build image (Oracle JDK 17 + sdkman) sets
+#   JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF-8 -Dhttps.protocols=TLSv1.2
+# which the JVM echoes to stderr as
+#   "Picked up JAVA_TOOL_OPTIONS: ..."
+# on every Java process start.
+#
+# AGP 7.4.x's prefab integration (GeneratePrefabPackages.kt:299 in
+# `reportErrors`) treats ANY line on prefab-cli's stderr as a fatal
+# error, regardless of the subprocess exit code. The JAVA_TOOL_OPTIONS
+# echo gets captured as an IllegalStateException, and
+# configureCMakeRelWithDebInfo fails with the cryptic message
+#   > Picked up JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8 ...
+# while the CMake configure itself never actually ran.
+#
+# AGP 8.x filters this line out; AGP 7.4.x (what we're on) does not.
+# Until we migrate to AGP 8 the portable workaround is to remove
+# JAVA_TOOL_OPTIONS from the environment before Gradle spawns the
+# prefab-cli subprocess — `env -u VAR CMD` does exactly that.
 install:
-  - ./gradlew :netscope-sdk:publishReleasePublicationToMavenLocal
+  - env -u JAVA_TOOL_OPTIONS ./gradlew :netscope-sdk:publishReleasePublicationToMavenLocal
