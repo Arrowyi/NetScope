@@ -153,6 +153,11 @@ Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeInit(JNIEnv*, jobject) {
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeSetDebugMode(JNIEnv*, jobject, jint flags) {
+    netscope::hook_manager_set_debug_flags(static_cast<int>(flags));
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeDestroy(JNIEnv*, jobject) {
     LOGI("nativeDestroy");
     netscope::hook_manager_destroy();

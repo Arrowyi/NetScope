@@ -48,6 +48,21 @@ struct HookReport {
     char failure_reason[256];
 };
 
+// ── Diagnostic flags ───────────────────────────────────────────────────────
+//
+// Bitfield passed to hook_manager_set_debug_flags() BEFORE hook_manager_init().
+// Intended ONLY for reproducing hard-to-debug hooker-conflict crashes on
+// specific OEM devices. Never ship with SKIP_HOOKS enabled — it disables
+// all traffic collection. See also NetScope.setDebugMode() in Kotlin and
+// README.md "Diagnostic mode" section.
+constexpr int DEBUG_NONE        = 0;
+constexpr int DEBUG_TRACE_HOOKS = 1 << 0;  // per-write log + bytehook debug logs
+constexpr int DEBUG_SKIP_HOOKS  = 1 << 1;  // init bytehook but register no stubs
+
+// Must be called before hook_manager_init(); changes after init are ignored.
+void hook_manager_set_debug_flags(int flags);
+int  hook_manager_debug_flags();
+
 int  hook_manager_init();            // returns 0 on ACTIVE / DEGRADED, non-zero on FAILED
 void hook_manager_destroy();
 void hook_manager_set_paused(bool paused);

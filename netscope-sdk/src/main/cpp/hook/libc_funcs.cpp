@@ -2,6 +2,7 @@
 #include "../netscope_log.h"
 #include <dlfcn.h>
 #include <atomic>
+#include <cstring>
 
 namespace netscope {
 
@@ -61,5 +62,25 @@ int resolve_libc_funcs() {
 }
 
 const LibcFuncs& libc() { return g_libc; }
+
+void* get_real_libc_for(const char* sym) {
+    if (!sym) return nullptr;
+    // Short, exact strcmp chain. Compiler folds this into a jump table.
+    // Keep in sync with LibcFuncs and resolve_libc_funcs() above.
+    #define MATCH(name) if (std::strcmp(sym, #name) == 0) return reinterpret_cast<void*>(g_libc.name)
+    MATCH(connect);
+    MATCH(close);
+    MATCH(getaddrinfo);
+    MATCH(send);
+    MATCH(sendto);
+    MATCH(write);
+    MATCH(writev);
+    MATCH(recv);
+    MATCH(recvfrom);
+    MATCH(read);
+    MATCH(readv);
+    #undef MATCH
+    return nullptr;
+}
 
 } // namespace netscope

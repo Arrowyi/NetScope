@@ -1,11 +1,62 @@
 #include "hook_stubs.h"
+#include "hook_manager.h"
+#include "libc_funcs.h"
 #include "../netscope_log.h"
 #include "bytehook.h"
 
 #include <array>
+#include <atomic>
 #include <mutex>
 
 namespace netscope {
+
+// ── Diagnostic post-hook trace ─────────────────────────────────────────────
+//
+// Called by bytehook AFTER each GOT slot write (one invocation per
+// {caller_lib, symbol}). Only enabled when DEBUG_TRACE_HOOKS is set in
+// hook_manager_debug_flags(), so the overhead is zero in production.
+//
+// For each write we get:
+//   - caller_path_name:  which library's GOT was patched
+//   - sym_name:          which libc symbol
+//   - new_func:          NetScope's stub (should always match our proxy)
+//   - prev_func:         the value that was in the GOT IMMEDIATELY before
+//                        bytehook wrote new_func
+//
+// If prev_func != dlsym(RTLD_NEXT)-resolved real libc, someone else was
+// already hooking this library → CONTESTED. That's the key signal for
+// diagnosing the asdk.httpclient crash pattern.
+static void post_hook_trace_cb(bytehook_stub_t /*task_stub*/, int status_code,
+                               const char* caller_path_name, const char* sym_name,
+                               void* new_func, void* prev_func, void* arg) {
+    if (status_code != BYTEHOOK_STATUS_CODE_OK) {
+        // bytehook couldn't patch this slot — usually benign (lib ignored
+        // via bytehook_add_ignore, or already hooked with the same stub).
+        LOGW("bytehook-trace: hook-fail lib=%s sym=%s status=%d",
+             caller_path_name ? caller_path_name : "?",
+             sym_name         ? sym_name         : "?",
+             status_code);
+        return;
+    }
+
+    void* expected_real_libc = arg;
+    const bool contested = expected_real_libc && prev_func &&
+                           prev_func != expected_real_libc &&
+                           prev_func != new_func;  // re-hook of our own slot
+
+    if (contested) {
+        LOGW("bytehook-trace: CONTESTED lib=%s sym=%s prev=%p (!= real libc=%p) new=%p "
+             "— another hooker was already active in this library",
+             caller_path_name ? caller_path_name : "?",
+             sym_name         ? sym_name         : "?",
+             prev_func, expected_real_libc, new_func);
+    } else {
+        LOGI("bytehook-trace: lib=%s sym=%s prev=%p new=%p",
+             caller_path_name ? caller_path_name : "?",
+             sym_name         ? sym_name         : "?",
+             prev_func, new_func);
+    }
+}
 
 // We register at most ~16 stubs (connect, close, getaddrinfo, 8 send/recv
 // variants, room for a few more). Fixed array avoids any allocator
@@ -37,6 +88,31 @@ int register_stub(const char* /*pathname_regex*/,
                   void**      /*old_func*/) {
     if (!sym || !new_func) return -1;
 
+    const int dbg = hook_manager_debug_flags();
+
+    // DEBUG_SKIP_HOOKS: diagnostic build that initialises bytehook but
+    // installs zero stubs. Lets HMI verify whether crashes are caused by
+    // our GOT writes vs. bytehook init itself (CFI disable, shadowhook
+    // relocation). We still succeed the call so hook_manager_init walks
+    // the same code paths; the status layer will surface DEGRADED with
+    // a clear diagnostic reason.
+    if (dbg & DEBUG_SKIP_HOOKS) {
+        LOGW("hook_stubs: DEBUG_SKIP_HOOKS active — NOT registering '%s' (stub=%p)",
+             sym, new_func);
+        return 0;
+    }
+
+    // DEBUG_TRACE_HOOKS: wire a post-hook callback so every GOT write
+    // logs { lib, sym, prev, new } and flags contested slots. We pass
+    // the dlsym-resolved real libc pointer as `arg` so the callback
+    // can decide contested vs. clean without allocating state.
+    bytehook_hooked_t post_cb  = nullptr;
+    void*             post_arg = nullptr;
+    if (dbg & DEBUG_TRACE_HOOKS) {
+        post_cb  = &post_hook_trace_cb;
+        post_arg = get_real_libc_for(sym);
+    }
+
     // callee_path_name = "libc.so" targets the symbol's defining library.
     // Bytehook walks every loaded caller's GOT/PLT and patches the slot
     // that resolves to libc.so's `sym`. Late-loaded callers are handled
@@ -45,8 +121,8 @@ int register_stub(const char* /*pathname_regex*/,
         /*callee_path_name=*/"libc.so",
         /*sym_name=*/sym,
         /*new_func=*/new_func,
-        /*hooked=*/nullptr,
-        /*hooked_arg=*/nullptr);
+        /*hooked=*/post_cb,
+        /*hooked_arg=*/post_arg);
     if (!h) {
         LOGE("hook_stubs: bytehook_hook_all('%s') failed — returned null stub",
              sym);

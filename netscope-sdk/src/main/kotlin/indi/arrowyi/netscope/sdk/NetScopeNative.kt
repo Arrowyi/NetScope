@@ -22,6 +22,7 @@ internal object NetScopeNative {
     }
 
     external fun nativeInit(): Int        // returns 0 on ACTIVE / DEGRADED, non-zero on FAILED
+    external fun nativeSetDebugMode(flags: Int)    // call BEFORE nativeInit; see NetScope.setDebugMode
     external fun nativeDestroy()
     external fun nativePause()
     external fun nativeResume()

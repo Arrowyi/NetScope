@@ -206,6 +206,19 @@ pitfalls otherwise.
 | 10      | HONOR AGM3-W09HN    | either                    | bytehook 1.1.1 / **MANUAL**    | _testing `68acdfb`_ |
 | IVI     | OEM car head-unit   | either                    | bytehook 1.1.1 / **MANUAL**    | _W^X structurally unreachable; field-testing `68acdfb`_ |
 
+## Diagnostic mode (`NetScope.setDebugMode`)
+
+When a device survives post-install GOT audit (`slots_corrupt=0`) and reports `ACTIVE`, yet the host app still crashes some time later in a specific thread (e.g. `asdk.httpclient` on HONOR AGM3-W09HN, ~14 s after init), the most likely cause is a **hooker conflict** — the host app's own native stack has its own PLT/GOT hooker whose trampolines live in a heap page, and NetScope's writes redirect calls *past* our proxy into that heap page later in the lifecycle.
+
+Rather than guessing, two bit-flags in `NetScope.setDebugMode()` split the hypothesis space:
+
+| Flag | What it isolates |
+|---|---|
+| `DEBUG_TRACE_HOOKS` (1) | Every GOT write logs `{caller_lib, symbol, prev, new}`. Lines tagged `CONTESTED` identify libraries that were **already hooked** when bytehook got there — `prev != dlsym(RTLD_NEXT)`. Positive hit ⇒ host-app hooker conflict; mitigate via `bytehook_add_ignore("<lib>.so")` or coordinate load order. |
+| `DEBUG_SKIP_HOOKS` (2)  | `bytehook_init` runs (CFI disable, shadowhook trampoline registration, the whole load path) but NetScope registers zero stubs. If the app STILL crashes, the trigger is the bytehook load/init path itself — fix lives one layer down (disable CFI-disable, ship without shadowhook, or fall back to a raw PLT patcher). |
+
+These flags must be set **before** `NetScope.init()`. See README §"Diagnostic mode" for the HMI recipe.
+
 ## If bytehook 1.1.1 fails
 
 Order of fallback plans:

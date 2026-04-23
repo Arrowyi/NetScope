@@ -15,6 +15,63 @@ object NetScope {
     private const val TAG = "NetScope"
     private var initialized = false
 
+    // ─── Diagnostic mode flags ────────────────────────────────────────────
+    //
+    // Bitwise OR these into [setDebugMode]. Diagnostic-only: used to
+    // pinpoint hard-to-reproduce hooker-conflict crashes on specific OEM
+    // devices (e.g. HONOR AGM3-W09HN / Android 10 where asdk.httpclient
+    // crashes ~14 s after init). See docs/HOOK_EVOLUTION.md and README
+    // "Diagnostic mode" section.
+    //
+    // NEVER ship with [DEBUG_SKIP_HOOKS] set in production — it disables
+    // all traffic collection. [DEBUG_TRACE_HOOKS] is safe to leave on but
+    // adds non-trivial logcat volume (~1 line per caller-lib × symbol).
+
+    /** No diagnostics (default). */
+    const val DEBUG_NONE: Int = 0
+
+    /**
+     * Log every GOT slot NetScope patches:
+     *   `bytehook-trace: lib=<caller> sym=<symbol> prev=<old> new=<new>`
+     * Warns `CONTESTED` if `prev` doesn't match the dlsym(RTLD_NEXT)-resolved
+     * real libc address (i.e. another PLT/GOT hooker got there first).
+     *
+     * Also turns on bytehook's own debug logs (tag: `bytehook`) and enables
+     * `bytehook_set_recordable(true)` so a post-mortem dump is possible.
+     */
+    const val DEBUG_TRACE_HOOKS: Int = 1 shl 0
+
+    /**
+     * Initialise bytehook BUT DO NOT register any of NetScope's stubs.
+     * The SDK finishes init in `DEGRADED` state with
+     * `failureReason = "diagnostic: DEBUG_SKIP_HOOKS — ..."`.
+     *
+     * Use to split "does NetScope's hook-install phase cause the crash?"
+     * from "does merely loading + initialising bytehook (CFI disable,
+     * shadowhook trampolines) cause the crash?". If a crash still occurs
+     * with this flag alone, the host app's native stack is incompatible
+     * with bytehook in this process — independent of NetScope's writes.
+     *
+     * Traffic is NOT collected in this mode. DO NOT ship enabled.
+     */
+    const val DEBUG_SKIP_HOOKS: Int = 1 shl 1
+
+    /**
+     * Configure diagnostic flags. MUST be called BEFORE [init] — calls
+     * after init have no effect. Pass [DEBUG_NONE] in production.
+     *
+     * Example (a one-shot diagnostic build asking "is the crash caused by
+     * NetScope's writes, or by bytehook's init alone?"):
+     *
+     * ```kotlin
+     * NetScope.setDebugMode(NetScope.DEBUG_TRACE_HOOKS or NetScope.DEBUG_SKIP_HOOKS)
+     * NetScope.init(context)
+     * ```
+     */
+    fun setDebugMode(flags: Int) {
+        NetScopeNative.nativeSetDebugMode(flags)
+    }
+
     /**
      * Load native library, install PLT hooks, start collecting statistics.
      * Safe to call multiple times — subsequent calls are no-ops.

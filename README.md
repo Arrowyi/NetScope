@@ -187,6 +187,61 @@ Right after the initial hook install, NetScope walks every loaded `.so` via `dl_
 
 Only `auditSlotsCorrupt > 0` triggers rollback. When it happens the audit calls `bytehook_unhook()` for every stub NetScope installed, restoring the pre-hook libc pointers into every GOT slot.
 
+## Diagnostic mode (for HMI integration agents)
+
+Most devices stay on `ACTIVE`. A small number of OEM + host-app combinations (notably some HONOR head-units running apps that internally hook libc themselves, e.g. `asdk.httpclient`) still crash some seconds after init even though the post-install GOT audit passes. When triaging such a device, enable diagnostic flags **before** `init()`:
+
+```kotlin
+// ONE LINE added in your Application.onCreate(), BEFORE NetScope.init().
+// The flags are additive — OR them together.
+NetScope.setDebugMode(
+    NetScope.DEBUG_TRACE_HOOKS   // log every GOT write + warn on CONTESTED slots
+    or NetScope.DEBUG_SKIP_HOOKS // init bytehook but register no stubs
+)
+NetScope.init(this)
+```
+
+### Flags
+
+| Flag | Effect | Safe for production? |
+|---|---|---|
+| `DEBUG_NONE` | Default. No extra logs. | ✔ |
+| `DEBUG_TRACE_HOOKS` | For each GOT write bytehook performs, log `{caller_lib, symbol, prev_func, new_func}`. If `prev_func` doesn't match the `dlsym(RTLD_NEXT)`-resolved real libc pointer, log `CONTESTED` — another PLT/GOT hooker was already active in that library. Also turns on bytehook's own `debug` stream (tag `bytehook`) and `bytehook_set_recordable(true)`. | ✔ (verbose logs only) |
+| `DEBUG_SKIP_HOOKS` | `bytehook_init` still runs (CFI disable, shadowhook trampoline registration, the whole load path) — but NetScope installs ZERO stubs. `HookReport.status = DEGRADED`, `failureReason = "diagnostic: DEBUG_SKIP_HOOKS — bytehook initialised (...), no stubs registered"`. **Traffic is NOT collected.** | ✖ diagnostic only |
+
+### Recommended recipe for a crashing device
+
+Ship ONE APK with a build-config toggle so QA can flip between these three modes at runtime (e.g. via a hidden developer-options switch) and collect logcat for each:
+
+1. **Build A — trace everything.** `setDebugMode(DEBUG_TRACE_HOOKS)`. Grep logcat for `bytehook-trace: CONTESTED ...`. If you see contested slots in the library whose thread later crashes (e.g. `libasdk.so`, `libhttpclient_asdk.so`), the crash is a **hooker conflict** — the host app's own hooker trampolines are in the middle of the call path. Mitigations:
+   - `bytehook_add_ignore("<host-app-hook-lib>.so")` to skip patching that specific library, and/or
+   - coordinate with the host-app team on load order so their hooker initialises *after* ours.
+
+2. **Build B — bytehook init only, no writes.** `setDebugMode(DEBUG_SKIP_HOOKS)`. If the app *still* crashes, NetScope's hook installation is not the trigger — merely loading and initialising bytehook on this device is incompatible with the host app's native stack. In that case the fix lives one layer down (disable CFI-disable, run without shadowhook, or switch to a raw PLT patcher). File an issue with the logcat and we will evaluate.
+
+3. **Build C — both flags.** `setDebugMode(DEBUG_TRACE_HOOKS or DEBUG_SKIP_HOOKS)`. Same as Build B but bytehook's own debug logs are on, so you can see exactly when/how bytehook's init path touches each library even though no stubs exist.
+
+### What the HMI agent should collect
+
+For each build, capture:
+- `adb logcat -s NetScope:V bytehook:V AndroidRuntime:E DEBUG:E` for ~30 s after app launch
+- `NetScope.getHookReport()` snapshot at +5 s, +15 s, +30 s (status, slot counts, failureReason)
+- Full tombstone if a native crash occurs (`/data/tombstones/tombstone_*`)
+
+The logs that pin the root cause look like:
+
+```
+W NetScope: bytehook-trace: CONTESTED lib=/data/app/.../libasdk_httpclient.so sym=send  \
+            prev=0x7a82310080 (!= real libc=0x7af4a0d120) new=0x7a7f2efca0 \
+            — another hooker was already active in this library
+```
+
+A line like that, immediately followed by a tombstone in that same library's thread, is conclusive evidence for Build A's hooker-conflict hypothesis.
+
+### Turning diagnostic mode off
+
+Ship subsequent production builds with `setDebugMode(NetScope.DEBUG_NONE)` (or just remove the call entirely — `DEBUG_NONE` is the default). `DEBUG_SKIP_HOOKS` MUST NOT leak into production: no traffic is collected while it is set.
+
 ## API Reference
 
 ### `NetScope` (object)
@@ -205,6 +260,7 @@ Only `auditSlotsCorrupt > 0` triggers rollback. When it happens the audit calls 
 | `setOnFlowEnd(callback?)` | Register per-connection close callback. Pass `null` to clear. |
 | `getHookReport(): HookReport` | Snapshot the current hook health. |
 | `setStatusListener(callback?)` | Get notified on every status transition. |
+| `setDebugMode(flags: Int)` | Set diagnostic flags. **Must** be called before `init()`. See "Diagnostic mode" above. Pass `DEBUG_NONE` (default) in production. |
 
 ### `Status` (enum)
 

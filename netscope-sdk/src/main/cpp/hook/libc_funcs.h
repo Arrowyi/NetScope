@@ -55,4 +55,10 @@ int resolve_libc_funcs();
 // failed (check before calling).
 const LibcFuncs& libc();
 
+// Look up the dlsym(RTLD_NEXT)-resolved real libc pointer by symbol name,
+// returning nullptr if the symbol is not one we intercept or dlsym failed
+// for it. Used by the diagnostic trace path (DEBUG_TRACE_HOOKS) to decide
+// whether a GOT slot's pre-write value indicates a conflicting hooker.
+void* get_real_libc_for(const char* sym);
+
 } // namespace netscope

@@ -30,6 +30,23 @@ static std::mutex                g_listener_mutex;
 static StatusListener            g_listener = nullptr;
 static void*                     g_listener_user = nullptr;
 
+// Diagnostic bitfield. Read from register_stub() (to skip registration),
+// init_bytehook_once() (to pass `debug=true` to bytehook), and the
+// trace-hook post-callback (to decide whether to log).
+static std::atomic<int>          g_debug_flags{DEBUG_NONE};
+
+void hook_manager_set_debug_flags(int flags) {
+    g_debug_flags.store(flags);
+    if (flags) {
+        LOGW("hook_manager: DEBUG FLAGS SET flags=0x%x — diagnostic build, "
+             "NOT FOR PRODUCTION USE", flags);
+    }
+}
+
+int hook_manager_debug_flags() {
+    return g_debug_flags.load();
+}
+
 // ─── Status / listener plumbing ─────────────────────────────────────────────
 
 static void notify_status_locked() {
@@ -181,12 +198,20 @@ static int init_bytehook_once() {
     if (prev == 1) return BYTEHOOK_STATUS_CODE_OK;
     if (prev == 2) return s_last_rc.load();
 
-    int rc = bytehook_init(BYTEHOOK_MODE_MANUAL, /*debug=*/false);
+    const bool bh_debug = (g_debug_flags.load() & DEBUG_TRACE_HOOKS) != 0;
+    int rc = bytehook_init(BYTEHOOK_MODE_MANUAL, /*debug=*/bh_debug);
     s_last_rc.store(rc);
     s_done.store(rc == BYTEHOOK_STATUS_CODE_OK ? 1 : 2);
-    LOGI("hook_manager: bytehook_init(MANUAL, debug=false) = %d (%s), ver=%s",
+    LOGI("hook_manager: bytehook_init(MANUAL, debug=%s) = %d (%s), ver=%s",
+         bh_debug ? "true" : "false",
          rc, bytehook_init_status_name(rc),
          bytehook_get_version() ? bytehook_get_version() : "?");
+    // Recordable mode lets us dump every hook action on demand later via
+    // bytehook_get_records(); paired with DEBUG_TRACE_HOOKS gives HMI a
+    // post-mortem dump if the logcat stream is lossy.
+    if (bh_debug) {
+        bytehook_set_recordable(true);
+    }
     return rc;
 }
 
@@ -234,6 +259,23 @@ int hook_manager_init() {
     // bytehook never tries to hook itself.
     bytehook_add_ignore("libnetscope.so");
     bytehook_add_ignore("libbytehook.so");
+
+    // DEBUG_SKIP_HOOKS: bytehook is fully initialised (including CFI
+    // disable + shadowhook trampoline registration) but we deliberately
+    // do not register any stubs. Use this to isolate whether init itself
+    // is what destabilises a given app (e.g. asdk.httpclient on HONOR
+    // AGM3-W09HN), separate from NetScope's GOT writes. Traffic is not
+    // collected in this mode. See README.md "Diagnostic mode".
+    if (g_debug_flags.load() & DEBUG_SKIP_HOOKS) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "diagnostic: DEBUG_SKIP_HOOKS — bytehook initialised "
+                      "(rc=%d, %s), no stubs registered",
+                      bhrc, bytehook_init_status_name(bhrc));
+        set_status(HOOK_STATUS_DEGRADED, buf);
+        LOGW("hook_manager_init: %s", buf);
+        return 0;
+    }
 
     // Register hooks. Each install_hook_*() ends up calling register_stub()
     // (hook_stubs.cpp), which in turn calls bytehook_hook_all(). Bytehook
