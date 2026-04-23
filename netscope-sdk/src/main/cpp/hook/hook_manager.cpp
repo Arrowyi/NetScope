@@ -16,6 +16,8 @@
 #include <csetjmp>
 #include <cerrno>
 #include <mutex>
+#include <set>
+#include <string>
 
 namespace netscope {
 
@@ -138,6 +140,53 @@ static void install_sigsegv_guard() {
     }
 }
 
+// ─── APK-embedded .so detection ─────────────────────────────────────────────
+//
+// Background: when the host APK is built with android:extractNativeLibs="false",
+// bionic's linker maps native libraries directly out of base.apk as a set of
+// PT_LOAD segments. /proc/self/maps reports synthesized paths like
+//   /data/app/<pkg>-<hash>/base.apk!/lib/arm64-v8a/libX.so
+// xhook 1.2.0's ELF parser mis-computes GOT addresses for this layout on some
+// OEM ROMs (HONOR Android 10 is a confirmed repro) — it writes our stub
+// pointers into rw-p heap pages that sit NEAR, not AT, the intended GOT
+// slot. A perfectly clean post-install audit results (slots_corrupt=0),
+// because the audit scans the set of GOTs we *intended* to patch, not the
+// set xhook *actually* wrote to. Minutes later, when the host app reads
+// one of those clobbered heap words back as a vtable pointer, it crashes
+// with pc == x8 in [anon:libc_malloc].
+//
+// We cannot fix xhook 1.2.0's internals (it's a prebuilt static library).
+// The next-best thing is to refuse to touch APK-embedded libraries
+// altogether. xhook_ignore(regex, nullptr) skips any library whose path
+// matches the regex during refresh, which is exactly what we need.
+
+// Returns the count of distinct APK-embedded libraries currently mapped.
+static int count_apk_embedded_libs(std::set<std::string>* out_paths) {
+    FILE* fp = std::fopen("/proc/self/maps", "re");
+    if (!fp) return 0;
+    std::set<std::string> seen;
+    char line[512];
+    while (std::fgets(line, sizeof(line), fp)) {
+        // Each maps line ends with an optional path. We only need the path.
+        char* bang = std::strstr(line, ".apk!/");
+        if (!bang) continue;
+        char* start = std::strrchr(line, ' ');
+        if (!start) continue;
+        ++start;
+        char* end = std::strchr(start, '\n');
+        if (end) *end = '\0';
+        // Only count once per distinct library path.
+        seen.emplace(start);
+    }
+    std::fclose(fp);
+    if (out_paths) *out_paths = std::move(seen);
+    return static_cast<int>(out_paths ? out_paths->size() : seen.size());
+}
+
+static bool path_is_apk_embedded(const char* p) {
+    return p && std::strstr(p, ".apk!/") != nullptr;
+}
+
 // ─── dlopen hooks ───────────────────────────────────────────────────────────
 // Cover libraries loaded after init. Guarded by SIGSEGV handler above.
 
@@ -146,6 +195,17 @@ static void refresh_hooks_for_new_lib(const char* filename) {
     // MUST NOT call xhook_refresh again — every refresh on this ROM can
     // corrupt more heap memory (see audit logic in hook_manager_init).
     if (g_status.load() == HOOK_STATUS_FAILED) return;
+
+    // Defense in depth: even though we register xhook_ignore(".apk!/...") at
+    // init, also refuse to trigger a refresh when an APK-embedded library is
+    // the cause of the refresh. This skips the entire xhook_refresh() traversal
+    // for such dlopens, which is safer than relying on xhook's ignore pass.
+    if (path_is_apk_embedded(filename)) {
+        LOGD("hook_manager: '%s' is APK-embedded — skipping refresh to avoid "
+             "xhook 1.2.0 GOT miscomputation",
+             filename);
+        return;
+    }
 
     if (g_refresh_in_progress.exchange(true)) return;
     LOGD("hook_manager: '%s' loaded, refreshing GOT hooks",
@@ -190,6 +250,39 @@ int hook_manager_init() {
 
     // Don't patch our own PLT — calls from libnetscope.so go straight to libc.
     xhook_ignore("libnetscope\\.so$", nullptr);
+
+    // Block APK-embedded .so files unconditionally. On some OEM ROMs
+    // (confirmed: HONOR Android 10 + extractNativeLibs=false) xhook 1.2.0's
+    // ELF parser mis-computes the GOT VA for the base.apk!/lib/... synthesized
+    // paths, causing stub pointers to land in unrelated rw-p heap pages and
+    // crashing the host app with pc == x8 in [anon:libc_malloc] minutes later,
+    // usually on the first native HTTP call. We can't fix xhook here; the
+    // only safe option is to refuse to touch these libraries.
+    //
+    // Regex covers both classic bionic syntax (base.apk!/lib/abi/libX.so)
+    // and the rarer suffix-less variant.
+    xhook_ignore(".*\\.apk!/.*\\.so$", nullptr);
+    xhook_ignore(".*\\.apk$",          nullptr);
+
+    // Log which libraries are being skipped so the field report is actionable.
+    std::set<std::string> skipped_paths;
+    int apk_embedded = count_apk_embedded_libs(&skipped_paths);
+    if (apk_embedded > 0) {
+        LOGW("hook_manager: detected %d APK-embedded .so file(s); xhook_ignore "
+             "applied. Host traffic from these libraries will NOT be tracked. "
+             "Integrator should set android:extractNativeLibs=\"true\" in "
+             "AndroidManifest.xml for full coverage.", apk_embedded);
+        // Cap log volume but surface a few sample paths.
+        int dumped = 0;
+        for (const auto& p : skipped_paths) {
+            LOGW("hook_manager:   skipped: %s", p.c_str());
+            if (++dumped >= 8) break;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_report_mutex);
+        g_report.apk_embedded_libs_skipped = apk_embedded;
+    }
 
     // Resolve real libc entry points via dlsym. We call these directly from
     // every hook handler instead of xhook's `orig_*`, which avoids chaining
@@ -332,22 +425,38 @@ int hook_manager_init() {
     }
 
     const int total_failures = fail_connect + fail_dns + fail_send_recv + fail_close;
-    if (total_failures == 0 && libc_complete && audit.slots_to_our_stub > 0) {
+    const bool hooks_ok = (total_failures == 0) && libc_complete && (audit.slots_to_our_stub > 0);
+
+    if (hooks_ok && apk_embedded == 0) {
         set_status(HOOK_STATUS_ACTIVE);
         LOGI("hook_manager_init: ACTIVE (audit: %d/%d slots hooked, %d libc, %d chained)",
              audit.slots_to_our_stub, audit.slots_total,
              audit.slots_to_real_libc, audit.slots_to_other_text);
+    } else if (hooks_ok && apk_embedded > 0) {
+        // Hooks themselves installed cleanly, but we *chose* to skip some
+        // APK-embedded libraries. Flag this as DEGRADED so the HMI can
+        // explain the partial coverage to the user.
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "skipped %d APK-embedded .so file(s) to avoid xhook 1.2.0 "
+                      "GOT miscomputation; set extractNativeLibs=\"true\" for "
+                      "full coverage (audit hooked=%d/%d slots)",
+                      apk_embedded,
+                      audit.slots_to_our_stub, audit.slots_total);
+        set_status(HOOK_STATUS_DEGRADED, buf);
+        LOGW("hook_manager_init: DEGRADED — %s", buf);
     } else {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
                       "partial hooks: connect=%s dns=%s send_recv=%s close=%s libc=%d/12 "
-                      "audit slots=%d hooked=%d",
+                      "audit slots=%d hooked=%d apk-embedded-skipped=%d",
                       fail_connect   ? "FAIL" : "ok",
                       fail_dns       ? "FAIL" : "ok",
                       fail_send_recv ? "FAIL" : "ok",
                       fail_close     ? "FAIL" : "ok",
                       libc_ok,
-                      audit.slots_total, audit.slots_to_our_stub);
+                      audit.slots_total, audit.slots_to_our_stub,
+                      apk_embedded);
         set_status(HOOK_STATUS_DEGRADED, buf);
         LOGW("hook_manager_init: %s", buf);
     }

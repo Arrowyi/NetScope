@@ -268,11 +268,17 @@ Additionally, `xhook_refresh` (both the initial install and any dlopen-triggered
 
 ### Environmental
 
-- **`extractNativeLibs="false"` on some OEM ROMs** (most notably HONOR Android 10, Knox-derived builds): the bionic linker maps native libraries directly out of `base.apk` as multiple segments, each reporting a synthesized path like `base.apk!/lib/arm64-v8a/libX.so`. xhook 1.2.0's ELF parser has been observed to mis-compute GOT addresses for this layout, occasionally writing stub pointers into rw-p anonymous heap memory instead of real GOT slots — which corrupts a random C++ object and crashes the host app with `pc == x8` in `[anon:libc_malloc]`. NetScope's post-install audit detects this as `auditSlotsCorrupt > 0` and self-disables (`Status.FAILED`). If you see that field nonzero, either:
-  - Set `android:extractNativeLibs="true"` in your app's `AndroidManifest.xml`, or
-  - Ship a build of NetScope based on bytehook / shadowhook 2.x instead of xhook (work in progress; bytehook handles APK-embedded .so layouts explicitly).
+- **`extractNativeLibs="false"` on some OEM ROMs** (confirmed on HONOR Android 10; similar behaviour suspected on Knox-derived builds): the bionic linker maps native libraries directly out of `base.apk` as multiple segments, each reporting a synthesized path like `/data/app/<pkg>-<hash>/base.apk!/lib/arm64-v8a/libX.so`. xhook 1.2.0's ELF parser mis-computes GOT addresses for this layout — it writes our stub pointers into rw-p anonymous heap pages that sit *near*, not *at*, the intended GOT slot. The initial post-install audit comes up perfectly clean (the slots we intended to patch are fine), but the clobbered heap words corrupt random C++ objects. Minutes later, when the host app dereferences one of them as a vtable pointer, the process crashes with `pc == x8` in `[anon:libc_malloc]`, typically on the first native HTTP call from an app-bundled .so.
 
-  Note: `auditHeapStubHits > 0` on its own is **not** a failure. It's an advisory count of NetScope stub pointers observed inside heap pages. Legitimate copies are expected (xhook maintains an internal `xh_core_hook_info_t` registry that stores every `new_func` we passed it; bionic keeps our SIGSEGV guard in its sigaction table; the dynamic linker stores library load-base values in several places). As long as `auditSlotsCorrupt == 0`, the real GOT is healthy and traffic collection is active.
+  **Current mitigation (automatic, shipped)**: NetScope registers `xhook_ignore(".*\\.apk!/.*\\.so$", nullptr)` *before* the first `xhook_refresh`. Every APK-embedded library is skipped outright — xhook never touches them, so it can never misroute a write. [HookReport.apkEmbeddedLibsSkipped](netscope-sdk/src/main/kotlin/indi/arrowyi/netscope/sdk/HookReport.kt) reports how many libraries were skipped; when > 0 the SDK stays in `Status.DEGRADED` with a `failureReason` naming the `extractNativeLibs=true` workaround.
+
+  Coverage impact: system libraries (`/system/lib64/*`, including `libssl`, `libcrypto`, `libconscrypt_jni` on most devices) are still fully hooked, so traffic originating from standard Java HTTP stacks (okhttp, HttpURLConnection, Conscrypt, WebView) is counted. Traffic from *app-bundled* native HTTP clients (custom `libcurl`-like stacks, game engines) is not counted.
+
+  Recovering full coverage:
+  - Set `android:extractNativeLibs="true"` in the host app's `AndroidManifest.xml` — the OS then extracts .so files onto disk at install time and the path contains no `!/`, so the xhook path is safe.
+  - Or wait for the in-progress bytehook / shadowhook 2.x migration; both handle APK-embedded layouts natively.
+
+  Note: `auditHeapStubHits > 0` on its own is **not** a failure. It's an advisory count of NetScope stub pointers observed inside heap pages. Legitimate copies are expected (xhook maintains an internal `xh_core_hook_info_t` registry that stores every `new_func` we passed it; bionic keeps our SIGSEGV guard in its sigaction table; the dynamic linker stores library load-base values in several places). The authoritative failure signal is `auditSlotsCorrupt > 0`.
 
 ### Functional
 

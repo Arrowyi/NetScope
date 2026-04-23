@@ -38,6 +38,15 @@ struct HookReport {
     int  audit_slots_corrupt;      // pointing to rw-p data / unmapped (BAD)
     int  audit_heap_stub_hits;     // stub addresses found in rw-p anon heap (BAD)
 
+    // Number of APK-embedded .so files (paths like
+    // /data/app/.../base.apk!/lib/arm64-v8a/libX.so) that were
+    // INTENTIONALLY skipped because xhook 1.2.0 mis-computes their GOT
+    // addresses on some ROMs. When > 0 the SDK stays in DEGRADED: traffic
+    // from system libraries is still captured, but calls from those
+    // app-bundled native libraries go unnumbered. Integrator should set
+    // android:extractNativeLibs="true" to recover full coverage.
+    int  apk_embedded_libs_skipped;
+
     // Short human-readable description of why the SDK is DEGRADED / FAILED.
     // Empty when status == ACTIVE.
     char failure_reason[256];

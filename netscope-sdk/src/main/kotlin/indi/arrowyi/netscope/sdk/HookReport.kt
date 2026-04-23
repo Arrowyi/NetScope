@@ -27,12 +27,8 @@ enum class Status(val nativeValue: Int) {
      * A critical failure occurred:
      * - SIGSEGV during xhook_refresh, or
      * - libc symbol resolution failed, or
-     * - **the post-install audit detected that GOT writes landed in
-     *   non-executable memory** (typical on HONOR Android 10 with
-     *   `extractNativeLibs=false`, where xhook 1.2.0 mis-parses the
-     *   APK-embedded .so layout and writes stub pointers into random
-     *   heap pages — see [HookReport.auditSlotsCorrupt] and
-     *   [HookReport.auditHeapStubHits]).
+     * - the post-install audit detected that GOT writes landed in
+     *   non-executable memory (see [HookReport.auditSlotsCorrupt]).
      *
      * No traffic data will be collected for this process. Prompt the
      * user / log to crashlytics.
@@ -65,9 +61,17 @@ enum class Status(val nativeValue: Int) {
  *                            (a third-party hooker got there first — not a crash risk)
  * @param auditSlotsCorrupt   of those, how many point into rw-p data / non-executable memory —
  *                            **nonzero means xhook misrouted a write** and forces FAILED
- * @param auditHeapStubHits   how many stub addresses were found floating in rw-p anonymous
- *                            heap memory (smoking-gun for the xhook+APK-embedded bug);
- *                            **nonzero forces FAILED**
+ * @param auditHeapStubHits   advisory count of stub addresses observed in rw-p heap
+ *                            pages; legitimate copies abound (xhook's registry, bionic
+ *                            sigaction table, soinfo) and this field on its own does
+ *                            **not** affect [status]. Use for offline triage only
+ * @param apkEmbeddedLibsSkipped number of `base.apk!/lib/...` synthesized library
+ *                            paths that were INTENTIONALLY skipped to dodge the
+ *                            xhook 1.2.0 GOT miscomputation bug. When > 0 the
+ *                            SDK stays in [Status.DEGRADED]: traffic originating
+ *                            from those APK-bundled native libraries will not
+ *                            be counted. Set `android:extractNativeLibs="true"`
+ *                            in the host AndroidManifest to recover full coverage
  * @param failureReason       empty when [status] is ACTIVE; otherwise a short
  *                            machine-readable reason suitable for logging
  */
@@ -84,6 +88,7 @@ data class HookReport(
     val auditSlotsChained: Int,
     val auditSlotsCorrupt: Int,
     val auditHeapStubHits: Int,
+    val apkEmbeddedLibsSkipped: Int,
     val failureReason: String?
 ) {
     val status: Status get() = Status.fromNative(statusCode)
@@ -93,10 +98,9 @@ data class HookReport(
 
     /**
      * True iff the post-install audit found at least one GOT slot that
-     * xhook wrote into non-executable memory, or at least one stub
-     * address lurking in the heap. These are the indicators for the
-     * HONOR Android 10 / xhook 1.2.0 / extractNativeLibs=false crash
-     * scenario. When true the SDK has already self-disabled.
+     * xhook wrote into non-executable memory. This is the authoritative
+     * signal for the HONOR Android 10 / xhook 1.2.0 / extractNativeLibs=false
+     * crash scenario. When true the SDK has already self-disabled.
      */
-    val auditFoundCorruption: Boolean get() = auditSlotsCorrupt > 0 || auditHeapStubHits > 0
+    val auditFoundCorruption: Boolean get() = auditSlotsCorrupt > 0
 }

@@ -90,8 +90,8 @@ static jobject build_hook_report(JNIEnv* env, const netscope::HookReport& r) {
     // (statusCode, libcResolved, connectOk, dnsOk, sendRecvOk, closeOk,
     //  auditSlotsTotal, auditSlotsHooked, auditSlotsUnhooked,
     //  auditSlotsChained, auditSlotsCorrupt, auditHeapStubHits,
-    //  failureReason)
-    jmethodID ctor = env->GetMethodID(cls, "<init>", "(IZZZZZIIIIIILjava/lang/String;)V");
+    //  apkEmbeddedLibsSkipped, failureReason)
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "(IZZZZZIIIIIIILjava/lang/String;)V");
     if (!ctor) {
         LOGE("build_hook_report: GetMethodID(<init>) failed");
         return nullptr;
@@ -110,6 +110,7 @@ static jobject build_hook_report(JNIEnv* env, const netscope::HookReport& r) {
         static_cast<jint>(r.audit_slots_chained),
         static_cast<jint>(r.audit_slots_corrupt),
         static_cast<jint>(r.audit_heap_stub_hits),
+        static_cast<jint>(r.apk_embedded_libs_skipped),
         reason);
 }
 
