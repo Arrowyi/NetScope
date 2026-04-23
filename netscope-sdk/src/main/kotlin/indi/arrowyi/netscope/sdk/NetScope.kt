@@ -18,17 +18,50 @@ object NetScope {
     /**
      * Load native library, install PLT hooks, start collecting statistics.
      * Safe to call multiple times — subsequent calls are no-ops.
+     *
+     * @return the SDK's [Status] after this call. Callers should check
+     *   against [Status.ACTIVE] / [Status.DEGRADED] / [Status.FAILED] and
+     *   surface the result in any diagnostic UI (HMI, overlay, etc.).
+     *   [getHookReport] returns the full detail.
      */
     @Synchronized
-    fun init(context: Context) {
-        if (initialized) return
+    fun init(context: Context): Status {
+        if (initialized) return getHookReport().status
         val ret = NetScopeNative.nativeInit()
-        if (ret != 0) {
-            Log.e(TAG, "Native init failed: $ret")
-            return
+        val report = getHookReport()
+        if (ret != 0 || report.status == Status.FAILED) {
+            Log.e(TAG, "Native init failed: ret=$ret status=${report.status} reason=${report.failureReason}")
+            initialized = (report.status != Status.FAILED)
+            return report.status
         }
         initialized = true
-        Log.i(TAG, "Initialized")
+        if (report.status == Status.DEGRADED) {
+            Log.w(TAG, "Initialized in DEGRADED state: ${report.failureReason}")
+        } else {
+            Log.i(TAG, "Initialized, status=${report.status}")
+        }
+        return report.status
+    }
+
+    /**
+     * Current hook health snapshot. Safe to call from any thread and at any
+     * time — returns NOT_INITIALIZED before [init] has run.
+     */
+    fun getHookReport(): HookReport = NetScopeNative.nativeGetHookReport()
+
+    /**
+     * Register a listener invoked whenever the SDK's overall [Status] changes.
+     *
+     * Typical use: show/hide an HMI indicator like "traffic monitor running"
+     * based on [HookReport.isCollecting]. The callback may be invoked on any
+     * thread (the one that triggered the transition — usually the init caller
+     * or the dlopen path that hit a bad library). Dispatch to the UI thread
+     * yourself if needed.
+     *
+     * Pass `null` to clear.
+     */
+    fun setStatusListener(callback: ((HookReport) -> Unit)?) {
+        NetScopeNative.nativeSetStatusListener(callback)
     }
 
     /** Pause stats collection. PLT hooks remain installed; bytes are not counted. */

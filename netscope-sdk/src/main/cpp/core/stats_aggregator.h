@@ -28,6 +28,11 @@ class StatsAggregator {
 public:
     static StatsAggregator& instance();
 
+    // Add bytes without incrementing the connection counter. Used by
+    // FlowTable::flush_in_flight() to report incremental traffic for
+    // connections that are still open.
+    void addBytes(const std::string& domain, uint64_t tx, uint64_t rx);
+    // Full flush at connection close: adds bytes AND increments connection count.
     void flush(const std::string& domain, uint64_t tx, uint64_t rx);
     void markIntervalBoundary();
     void clear();

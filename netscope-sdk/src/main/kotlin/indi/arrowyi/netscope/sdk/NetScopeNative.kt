@@ -3,7 +3,7 @@ package indi.arrowyi.netscope.sdk
 internal object NetScopeNative {
     init { System.loadLibrary("netscope") }
 
-    external fun nativeInit(): Int        // returns 0 on success
+    external fun nativeInit(): Int        // returns 0 on ACTIVE / DEGRADED, non-zero on FAILED
     external fun nativeDestroy()
     external fun nativePause()
     external fun nativeResume()
@@ -12,6 +12,10 @@ internal object NetScopeNative {
     external fun nativeGetDomainStats(): Array<DomainStats>
     external fun nativeGetIntervalStats(): Array<DomainStats>
     external fun nativeSetFlowEndCallback(callback: ((DomainStats) -> Unit)?)
+
+    // Hook health / status — see HookReport.kt
+    external fun nativeGetHookReport(): HookReport
+    external fun nativeSetStatusListener(callback: ((HookReport) -> Unit)?)
 
     // Test helpers
     external fun testParseSni(buf: ByteArray): String?

@@ -18,6 +18,7 @@
 
 #include "hook_send_recv.h"
 #include "hook_manager.h"
+#include "libc_funcs.h"
 #include "../core/flow_table.h"
 #include "../utils/tls_sni_parser.h"
 #include "../netscope_log.h"
@@ -29,14 +30,9 @@
 
 namespace netscope {
 
-static ssize_t (*orig_send)(int, const void*, size_t, int)                                      = nullptr;
-static ssize_t (*orig_sendto)(int, const void*, size_t, int, const struct sockaddr*, socklen_t) = nullptr;
-static ssize_t (*orig_write)(int, const void*, size_t)                                          = nullptr;
-static ssize_t (*orig_writev)(int, const struct iovec*, int)                                    = nullptr;
-static ssize_t (*orig_recv)(int, void*, size_t, int)                                            = nullptr;
-static ssize_t (*orig_recvfrom)(int, void*, size_t, int, struct sockaddr*, socklen_t*)          = nullptr;
-static ssize_t (*orig_read)(int, void*, size_t)                                                 = nullptr;
-static ssize_t (*orig_readv)(int, const struct iovec*, int)                                     = nullptr;
+// See libc_funcs.h — all calls to the real libc go through libc().* which is
+// resolved via dlsym at init time. This bypasses xhook's `orig_*` chain and
+// prevents crashes when the host app has also hooked these symbols.
 
 static void try_resolve_domain(int fd, const void* buf, size_t len) {
     if (FlowTable::instance().is_first_send_done(fd)) return;
@@ -63,9 +59,10 @@ static void try_resolve_domain(int fd, const void* buf, size_t len) {
 }
 
 static ssize_t hook_send(int fd, const void* buf, size_t len, int flags) {
-    if (!orig_send) return -1;
-    ssize_t ret = orig_send(fd, buf, len, flags);
-    if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
+    auto real = libc().send;
+    if (!real) return -1;
+    ssize_t ret = real(fd, buf, len, flags);
+    if (!hook_manager_is_enabled() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) {
         try_resolve_domain(fd, buf, len);
         FlowTable::instance().add_tx(fd, static_cast<uint64_t>(ret));
@@ -75,9 +72,10 @@ static ssize_t hook_send(int fd, const void* buf, size_t len, int flags) {
 
 static ssize_t hook_sendto(int fd, const void* buf, size_t len, int flags,
                             const struct sockaddr* dest, socklen_t dest_len) {
-    if (!orig_sendto) return -1;
-    ssize_t ret = orig_sendto(fd, buf, len, flags, dest, dest_len);
-    if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
+    auto real = libc().sendto;
+    if (!real) return -1;
+    ssize_t ret = real(fd, buf, len, flags, dest, dest_len);
+    if (!hook_manager_is_enabled() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) {
         try_resolve_domain(fd, buf, len);
         FlowTable::instance().add_tx(fd, static_cast<uint64_t>(ret));
@@ -86,9 +84,10 @@ static ssize_t hook_sendto(int fd, const void* buf, size_t len, int flags,
 }
 
 static ssize_t hook_write(int fd, const void* buf, size_t len) {
-    if (!orig_write) return -1;
-    ssize_t ret = orig_write(fd, buf, len);
-    if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
+    auto real = libc().write;
+    if (!real) return -1;
+    ssize_t ret = real(fd, buf, len);
+    if (!hook_manager_is_enabled() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) {
         try_resolve_domain(fd, buf, len);
         FlowTable::instance().add_tx(fd, static_cast<uint64_t>(ret));
@@ -97,71 +96,79 @@ static ssize_t hook_write(int fd, const void* buf, size_t len) {
 }
 
 static ssize_t hook_writev(int fd, const struct iovec* iov, int iovcnt) {
-    if (!orig_writev) return -1;
-    ssize_t ret = orig_writev(fd, iov, iovcnt);
-    if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
+    auto real = libc().writev;
+    if (!real) return -1;
+    ssize_t ret = real(fd, iov, iovcnt);
+    if (!hook_manager_is_enabled() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) FlowTable::instance().add_tx(fd, static_cast<uint64_t>(ret));
     return ret;
 }
 
 static ssize_t hook_recv(int fd, void* buf, size_t len, int flags) {
-    if (!orig_recv) return -1;
-    ssize_t ret = orig_recv(fd, buf, len, flags);
-    if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
+    auto real = libc().recv;
+    if (!real) return -1;
+    ssize_t ret = real(fd, buf, len, flags);
+    if (!hook_manager_is_enabled() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) FlowTable::instance().add_rx(fd, static_cast<uint64_t>(ret));
     return ret;
 }
 
 static ssize_t hook_recvfrom(int fd, void* buf, size_t len, int flags,
                               struct sockaddr* src, socklen_t* src_len) {
-    if (!orig_recvfrom) return -1;
-    ssize_t ret = orig_recvfrom(fd, buf, len, flags, src, src_len);
-    if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
+    auto real = libc().recvfrom;
+    if (!real) return -1;
+    ssize_t ret = real(fd, buf, len, flags, src, src_len);
+    if (!hook_manager_is_enabled() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) FlowTable::instance().add_rx(fd, static_cast<uint64_t>(ret));
     return ret;
 }
 
 static ssize_t hook_read(int fd, void* buf, size_t len) {
-    if (!orig_read) return -1;
-    ssize_t ret = orig_read(fd, buf, len);
-    if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
+    auto real = libc().read;
+    if (!real) return -1;
+    ssize_t ret = real(fd, buf, len);
+    if (!hook_manager_is_enabled() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) FlowTable::instance().add_rx(fd, static_cast<uint64_t>(ret));
     return ret;
 }
 
 static ssize_t hook_readv(int fd, const struct iovec* iov, int iovcnt) {
-    if (!orig_readv) return -1;
-    ssize_t ret = orig_readv(fd, iov, iovcnt);
-    if (hook_manager_is_paused() || !FlowTable::instance().contains(fd)) return ret;
+    auto real = libc().readv;
+    if (!real) return -1;
+    ssize_t ret = real(fd, iov, iovcnt);
+    if (!hook_manager_is_enabled() || !FlowTable::instance().contains(fd)) return ret;
     if (ret > 0) FlowTable::instance().add_rx(fd, static_cast<uint64_t>(ret));
     return ret;
 }
 
-void install_hook_send_recv() {
-#define REG(sym, fn, orig) \
-    do { if (xhook_register(".*\\.so$", sym, (void*)(fn), (void**)(orig)) != 0) \
-             LOGE("hook_send_recv: register '%s' failed", sym); } while(0)
+int install_hook_send_recv() {
+    int failures = 0;
+#define REG(sym, fn) \
+    do { int r = xhook_register(".*\\.so$", sym, (void*)(fn), nullptr); \
+         if (r != 0) { LOGE("hook_send_recv: register '%s' failed ret=%d", sym, r); ++failures; } } while(0)
 
-    REG("send",     hook_send,     &orig_send);
-    REG("sendto",   hook_sendto,   &orig_sendto);
-    REG("write",    hook_write,    &orig_write);
-    REG("writev",   hook_writev,   &orig_writev);
-    REG("recv",     hook_recv,     &orig_recv);
-    REG("recvfrom", hook_recvfrom, &orig_recvfrom);
-    REG("read",     hook_read,     &orig_read);
-    REG("readv",    hook_readv,    &orig_readv);
+    REG("send",     hook_send);
+    REG("sendto",   hook_sendto);
+    REG("write",    hook_write);
+    REG("writev",   hook_writev);
+    REG("recv",     hook_recv);
+    REG("recvfrom", hook_recvfrom);
+    REG("read",     hook_read);
+    REG("readv",    hook_readv);
 #undef REG
+    return failures;
 }
 
 void verify_hook_send_recv() {
-    LOGI("hook_send_recv: send=%p sendto=%p write=%p writev=%p "
+    const auto& l = libc();
+    LOGI("hook_send_recv: libc.send=%p sendto=%p write=%p writev=%p "
          "recv=%p recvfrom=%p read=%p readv=%p",
-         (void*)orig_send,  (void*)orig_sendto,
-         (void*)orig_write, (void*)orig_writev,
-         (void*)orig_recv,  (void*)orig_recvfrom,
-         (void*)orig_read,  (void*)orig_readv);
-    if (!orig_send || !orig_write || !orig_recv || !orig_read)
-        LOGE("hook_send_recv: one or more critical hooks not applied");
+         (void*)l.send,  (void*)l.sendto,
+         (void*)l.write, (void*)l.writev,
+         (void*)l.recv,  (void*)l.recvfrom,
+         (void*)l.read,  (void*)l.readv);
+    if (!l.send || !l.write || !l.recv || !l.read)
+        LOGE("hook_send_recv: libc resolution incomplete for one or more symbols");
 }
 
 void uninstall_hook_send_recv() {}

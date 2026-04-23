@@ -1,5 +1,9 @@
 #include "flow_table.h"
+#include "stats_aggregator.h"
+#include "../netscope_log.h"
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace netscope {
 
@@ -71,6 +75,38 @@ bool FlowTable::get(int fd, FlowEntry* out) {
     if (it == table_.end()) return false;
     if (out) *out = it->second;
     return true;
+}
+
+size_t FlowTable::flush_in_flight() {
+    struct Delta { std::string domain; uint64_t tx; uint64_t rx; };
+    std::vector<Delta> deltas;
+    uint64_t total_tx = 0, total_rx = 0;
+    {
+        std::unique_lock lock(mutex_);
+        deltas.reserve(table_.size());
+        for (auto& [fd, e] : table_) {
+            uint64_t dtx = e.tx_bytes - e.tx_reported;
+            uint64_t drx = e.rx_bytes - e.rx_reported;
+            if (dtx == 0 && drx == 0) continue;
+            const char* key = e.domain[0] ? e.domain : e.remote_ip;
+            if (!key || !key[0]) continue;
+            deltas.push_back({std::string(key), dtx, drx});
+            e.tx_reported = e.tx_bytes;
+            e.rx_reported = e.rx_bytes;
+            total_tx += dtx;
+            total_rx += drx;
+        }
+    }
+    for (auto& d : deltas) {
+        StatsAggregator::instance().addBytes(d.domain, d.tx, d.rx);
+    }
+    if (!deltas.empty()) {
+        LOGD("flow-table: flush_in_flight flows=%zu tx=%llu rx=%llu",
+             deltas.size(),
+             (unsigned long long)total_tx,
+             (unsigned long long)total_rx);
+    }
+    return deltas.size();
 }
 
 } // namespace netscope

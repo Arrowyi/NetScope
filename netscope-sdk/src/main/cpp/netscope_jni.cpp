@@ -70,12 +70,65 @@ static jobjectArray make_interval_array(JNIEnv* env, const std::vector<netscope:
 
 // Global JVM reference for callback thread attachment
 static JavaVM* g_jvm = nullptr;
-static jobject g_callback_obj = nullptr;  // GlobalRef to Kotlin lambda
+static jobject g_callback_obj = nullptr;         // GlobalRef to Kotlin flow-end lambda
+static jobject g_status_callback_obj = nullptr;  // GlobalRef to Kotlin status lambda
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     g_jvm = vm;
     LOGI("JNI_OnLoad: jvm=%p", (void*)vm);
     return JNI_VERSION_1_6;
+}
+
+// Build a Kotlin HookReport data class from a native HookReport.
+static jobject build_hook_report(JNIEnv* env, const netscope::HookReport& r) {
+    jclass cls = env->FindClass("indi/arrowyi/netscope/sdk/HookReport");
+    if (!cls) {
+        LOGE("build_hook_report: FindClass(HookReport) failed");
+        return nullptr;
+    }
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "(IZZZZZLjava/lang/String;)V");
+    if (!ctor) {
+        LOGE("build_hook_report: GetMethodID(<init>) failed");
+        return nullptr;
+    }
+    jstring reason = r.failure_reason[0] ? env->NewStringUTF(r.failure_reason) : nullptr;
+    return env->NewObject(cls, ctor,
+        static_cast<jint>(r.status),
+        static_cast<jboolean>(r.libc_resolved),
+        static_cast<jboolean>(r.connect_ok),
+        static_cast<jboolean>(r.dns_ok),
+        static_cast<jboolean>(r.send_recv_ok),
+        static_cast<jboolean>(r.close_ok),
+        reason);
+}
+
+// C-side status listener → forwards to the Kotlin lambda.
+static void status_listener_trampoline(const netscope::HookReport& r, void* /*user*/) {
+    if (!g_jvm || !g_status_callback_obj) return;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            LOGE("status_listener: AttachCurrentThread failed");
+            return;
+        }
+        attached = true;
+    }
+    jobject report = build_hook_report(env, r);
+    if (!report) { if (attached) g_jvm->DetachCurrentThread(); return; }
+    jclass fn_cls = env->GetObjectClass(g_status_callback_obj);
+    jmethodID invoke = env->GetMethodID(fn_cls, "invoke", "(Ljava/lang/Object;)Ljava/lang/Object;");
+    if (invoke) {
+        env->CallObjectMethod(g_status_callback_obj, invoke, report);
+        if (env->ExceptionCheck()) {
+            LOGE("status_listener: Kotlin callback threw");
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+    }
+    env->DeleteLocalRef(report);
+    env->DeleteLocalRef(fn_cls);
+    if (attached) g_jvm->DetachCurrentThread();
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -111,18 +164,46 @@ Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeClearStats(JNIEnv*, jobject)
 
 extern "C" JNIEXPORT void JNICALL
 Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeMarkIntervalBoundary(JNIEnv*, jobject) {
+    // Push incremental bytes from every still-open flow into the aggregator
+    // BEFORE marking the boundary, so long-lived connections show up in the
+    // interval snapshot we are about to take.
+    netscope::FlowTable::instance().flush_in_flight();
     netscope::StatsAggregator::instance().markIntervalBoundary();
     LOGD("nativeMarkIntervalBoundary: snapshot taken");
 }
 
 extern "C" JNIEXPORT jobjectArray JNICALL
 Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeGetDomainStats(JNIEnv* env, jobject) {
+    // Reflect any bytes accumulated on still-open flows in the cumulative view.
+    netscope::FlowTable::instance().flush_in_flight();
     return make_stats_array(env, netscope::StatsAggregator::instance().getDomainStats());
 }
 
 extern "C" JNIEXPORT jobjectArray JNICALL
 Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeGetIntervalStats(JNIEnv* env, jobject) {
     return make_interval_array(env, netscope::StatsAggregator::instance().getIntervalStats());
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeGetHookReport(JNIEnv* env, jobject) {
+    return build_hook_report(env, netscope::hook_manager_report());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_indi_arrowyi_netscope_sdk_NetScopeNative_nativeSetStatusListener(JNIEnv* env, jobject,
+                                                              jobject callback) {
+    if (g_status_callback_obj) {
+        env->DeleteGlobalRef(g_status_callback_obj);
+        g_status_callback_obj = nullptr;
+    }
+    if (!callback) {
+        netscope::hook_manager_set_status_listener(nullptr, nullptr);
+        LOGI("nativeSetStatusListener: cleared");
+        return;
+    }
+    g_status_callback_obj = env->NewGlobalRef(callback);
+    netscope::hook_manager_set_status_listener(status_listener_trampoline, nullptr);
+    LOGI("nativeSetStatusListener: registered");
 }
 
 extern "C" JNIEXPORT void JNICALL

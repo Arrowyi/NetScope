@@ -1,5 +1,6 @@
 #include "hook_dns.h"
 #include "hook_manager.h"
+#include "libc_funcs.h"
 #include "../core/dns_cache.h"
 #include "../netscope_log.h"
 #include "xhook.h"
@@ -10,13 +11,15 @@
 
 namespace netscope {
 
-static int (*orig_getaddrinfo)(const char*, const char*, const struct addrinfo*, struct addrinfo**) = nullptr;
+// See libc_funcs.h — we don't use xhook's `orig_*` anymore. Call real libc
+// directly so we never chain into another hooker's trampoline.
 
 static int hook_getaddrinfo(const char* node, const char* service,
                              const struct addrinfo* hints, struct addrinfo** res) {
-    if (!orig_getaddrinfo) return -1;
-    int ret = orig_getaddrinfo(node, service, hints, res);
-    if (hook_manager_is_paused() || ret != 0 || !node || !res || !*res) return ret;
+    auto real = libc().getaddrinfo;
+    if (!real) return EAI_SYSTEM;
+    int ret = real(node, service, hints, res);
+    if (!hook_manager_is_enabled() || ret != 0 || !node || !res || !*res) return ret;
 
     int stored = 0;
     for (struct addrinfo* ai = *res; ai != nullptr; ai = ai->ai_next) {
@@ -36,14 +39,15 @@ static int hook_getaddrinfo(const char* node, const char* service,
     return ret;
 }
 
-void install_hook_dns() {
-    int ret = xhook_register(".*\\.so$", "getaddrinfo", (void*)hook_getaddrinfo, (void**)&orig_getaddrinfo);
+int install_hook_dns() {
+    int ret = xhook_register(".*\\.so$", "getaddrinfo", (void*)hook_getaddrinfo, nullptr);
     if (ret != 0) LOGE("hook_dns: xhook_register failed ret=%d", ret);
+    return ret;
 }
 
 void verify_hook_dns() {
-    if (orig_getaddrinfo) LOGI("hook_dns: active orig=%p", (void*)orig_getaddrinfo);
-    else                  LOGE("hook_dns: orig_getaddrinfo null — DNS not hooked");
+    if (libc().getaddrinfo) LOGI("hook_dns: libc.getaddrinfo=%p", (void*)libc().getaddrinfo);
+    else                    LOGE("hook_dns: libc.getaddrinfo null — DNS pass-through disabled");
 }
 
 void uninstall_hook_dns() {}

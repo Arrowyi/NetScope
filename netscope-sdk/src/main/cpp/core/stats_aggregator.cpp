@@ -1,4 +1,5 @@
 #include "stats_aggregator.h"
+#include "../netscope_log.h"
 #include <chrono>
 #include <cstring>
 
@@ -14,57 +15,69 @@ int64_t StatsAggregator::now_ms() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-void StatsAggregator::flush(const std::string& domain, uint64_t tx, uint64_t rx) {
-    if (domain.empty()) return;
+void StatsAggregator::addBytes(const std::string& domain, uint64_t tx, uint64_t rx) {
+    if (domain.empty() || (tx == 0 && rx == 0)) return;
     {
-        // Fast path: record exists, update atomics without write lock
+        // Fast path: record exists, update atomics under shared lock.
         std::shared_lock<std::shared_mutex> rlock(records_mutex_);
         auto it = records_.find(domain);
         if (it != records_.end()) {
-            it->second.tx_total    += tx;
-            it->second.rx_total    += rx;
+            it->second.tx_total += tx;
+            it->second.rx_total += rx;
+            it->second.tx_curr  += tx;
+            it->second.rx_curr  += rx;
+            it->second.last_active_ms.store(now_ms());
+            return;
+        }
+    }
+    // Slow path: insert or locate under write lock, then add.
+    std::unique_lock<std::shared_mutex> wlock(records_mutex_);
+    auto& r = records_[domain];
+    r.tx_total += tx;
+    r.rx_total += rx;
+    r.tx_curr  += tx;
+    r.rx_curr  += rx;
+    r.last_active_ms.store(now_ms());
+}
+
+void StatsAggregator::flush(const std::string& domain, uint64_t tx, uint64_t rx) {
+    if (domain.empty()) return;
+    // Always ensure the record exists so the connection count is recorded
+    // even when a closed flow carried zero bytes.
+    addBytes(domain, tx, rx);
+    {
+        std::shared_lock<std::shared_mutex> rlock(records_mutex_);
+        auto it = records_.find(domain);
+        if (it != records_.end()) {
             it->second.count_total += 1;
-            it->second.tx_curr     += tx;
-            it->second.rx_curr     += rx;
             it->second.count_curr  += 1;
             it->second.last_active_ms.store(now_ms());
             return;
         }
     }
-    // Slow path: new domain
+    // tx == 0 && rx == 0: addBytes short-circuited, create an empty record now.
     std::unique_lock<std::shared_mutex> wlock(records_mutex_);
-    // Re-check under write lock (another thread may have inserted between our two locks)
-    auto it2 = records_.find(domain);
-    if (it2 != records_.end()) {
-        it2->second.tx_total    += tx;
-        it2->second.rx_total    += rx;
-        it2->second.count_total += 1;
-        it2->second.tx_curr     += tx;
-        it2->second.rx_curr     += rx;
-        it2->second.count_curr  += 1;
-        it2->second.last_active_ms.store(now_ms());
-        return;
-    }
     auto& r = records_[domain];
-    r.tx_total    = tx;
-    r.rx_total    = rx;
-    r.count_total = 1;
-    r.tx_curr     = tx;
-    r.rx_curr     = rx;
-    r.count_curr  = 1;
-    r.last_active_ms = now_ms();
+    r.count_total += 1;
+    r.count_curr  += 1;
+    r.last_active_ms.store(now_ms());
 }
 
 void StatsAggregator::markIntervalBoundary() {
-    std::shared_lock<std::shared_mutex> rlock(records_mutex_);
-    std::lock_guard<std::mutex> slock(snap_mutex_);
-    snapshot_.clear();
-    for (auto& [domain, r] : records_) {
-        snapshot_[domain] = {
-            r.tx_curr.exchange(0),
-            r.rx_curr.exchange(0),
-            r.count_curr.exchange(0)
-        };
+    size_t non_zero = 0;
+    {
+        std::shared_lock<std::shared_mutex> rlock(records_mutex_);
+        std::lock_guard<std::mutex> slock(snap_mutex_);
+        snapshot_.clear();
+        for (auto& [domain, r] : records_) {
+            uint64_t tx = r.tx_curr.exchange(0);
+            uint64_t rx = r.rx_curr.exchange(0);
+            uint32_t cc = r.count_curr.exchange(0);
+            snapshot_[domain] = { tx, rx, cc };
+            if (tx || rx) ++non_zero;
+        }
+        LOGD("stats: markIntervalBoundary records=%zu non_zero=%zu",
+             records_.size(), non_zero);
     }
 }
 

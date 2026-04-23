@@ -30,13 +30,15 @@ internal object LogcatReporter {
 
     private fun printReport() {
         NetScopeNative.nativeMarkIntervalBoundary()
-        val interval = NetScopeNative.nativeGetIntervalStats()
+        val rawInterval = NetScopeNative.nativeGetIntervalStats()
+        val rawCumulative = NetScopeNative.nativeGetDomainStats()
+        val interval = rawInterval
             .filter { it.txBytesInterval + it.rxBytesInterval > 0 }
             .sortedByDescending { it.txBytesInterval + it.rxBytesInterval }
-        val cumulative = NetScopeNative.nativeGetDomainStats()
-            .sortedByDescending { it.totalBytes }
+        val cumulative = rawCumulative.sortedByDescending { it.totalBytes }
 
         val ts = dateFmt.format(Date())
+        Log.d(TAG, "report raw interval=${rawInterval.size} cumulative=${rawCumulative.size}")
         Log.i(TAG, "══════ Traffic Report [$ts] ══════")
         Log.i(TAG, "── Interval ──────────────────────────────")
         interval.forEach { s ->

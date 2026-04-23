@@ -13,6 +13,11 @@ struct FlowEntry {
     char     domain[256];
     uint64_t tx_bytes        = 0;
     uint64_t rx_bytes        = 0;
+    // Bytes already pushed to StatsAggregator. Used to compute the delta on each
+    // interval boundary (and on close) so long-lived connections can be reported
+    // incrementally without double-counting.
+    uint64_t tx_reported     = 0;
+    uint64_t rx_reported     = 0;
     bool     domain_from_sni = false;  // SNI/Host already resolved → skip DNS override
     bool     first_send_done = false;
 };
@@ -33,6 +38,11 @@ public:
     bool   remove(int fd, FlowEntry* out);
     // Read-only peek (returns false if fd not found)
     bool   get(int fd, FlowEntry* out);
+    // Push the per-flow delta (tx_bytes - tx_reported, rx_bytes - rx_reported) into
+    // StatsAggregator for every active flow, then advance tx_reported/rx_reported to
+    // the current totals. Enables long-lived connections to show up in reports without
+    // waiting for close(). Returns the number of flows that contributed data.
+    size_t flush_in_flight();
 
 private:
     FlowTable() = default;
