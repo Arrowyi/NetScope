@@ -86,7 +86,12 @@ static jobject build_hook_report(JNIEnv* env, const netscope::HookReport& r) {
         LOGE("build_hook_report: FindClass(HookReport) failed");
         return nullptr;
     }
-    jmethodID ctor = env->GetMethodID(cls, "<init>", "(IZZZZZLjava/lang/String;)V");
+    // Signature mirrors HookReport.kt primary constructor.
+    // (statusCode, libcResolved, connectOk, dnsOk, sendRecvOk, closeOk,
+    //  auditSlotsTotal, auditSlotsHooked, auditSlotsUnhooked,
+    //  auditSlotsChained, auditSlotsCorrupt, auditHeapStubHits,
+    //  failureReason)
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "(IZZZZZIIIIIILjava/lang/String;)V");
     if (!ctor) {
         LOGE("build_hook_report: GetMethodID(<init>) failed");
         return nullptr;
@@ -99,6 +104,12 @@ static jobject build_hook_report(JNIEnv* env, const netscope::HookReport& r) {
         static_cast<jboolean>(r.dns_ok),
         static_cast<jboolean>(r.send_recv_ok),
         static_cast<jboolean>(r.close_ok),
+        static_cast<jint>(r.audit_slots_total),
+        static_cast<jint>(r.audit_slots_hooked),
+        static_cast<jint>(r.audit_slots_unhooked),
+        static_cast<jint>(r.audit_slots_chained),
+        static_cast<jint>(r.audit_slots_corrupt),
+        static_cast<jint>(r.audit_heap_stub_hits),
         reason);
 }
 

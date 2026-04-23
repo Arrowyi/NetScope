@@ -160,13 +160,28 @@ val report = NetScope.getHookReport()
 
 | Condition | Status |
 |---|---|
-| Everything installed cleanly | `ACTIVE` |
+| Everything installed cleanly and the post-install audit confirmed every GOT write went to a real GOT slot | `ACTIVE` |
 | One of the `xhook_register` calls failed but others succeeded | `DEGRADED` |
 | A runtime `dlopen` triggered an xhook refresh that crashed (rare, vendor-specific GOT layouts) — SDK rolled back, host app keeps running | `DEGRADED` |
 | `xhook_refresh` crashed during initial install → fully rolled back | `FAILED` |
 | A critical libc symbol (connect / send / recv / read) failed to resolve via dlsym | `FAILED` |
+| **Post-install audit detected GOT writes landing in non-executable memory** (see `auditSlotsCorrupt` / `auditHeapStubHits` below) | `FAILED` |
 
-When the status is `FAILED`, NetScope's hook handlers short-circuit and stop collecting data, but your app's network calls continue to work as if NetScope weren't there.
+When the status is `FAILED`, NetScope's hook handlers short-circuit and stop collecting data, future `dlopen`s no longer trigger `xhook_refresh` (to prevent further memory corruption), and your app's network calls continue to work as if NetScope weren't there.
+
+### Post-install GOT audit
+
+Right after `xhook_refresh()`, NetScope walks every loaded `.so` via `dl_iterate_phdr`, reads the actual GOT entry for each of the ~11 libc symbols we patch, and classifies what the GOT currently holds:
+
+| Audit bucket | Meaning |
+|---|---|
+| `auditSlotsHooked`   | GOT points to a NetScope stub — correct. |
+| `auditSlotsUnhooked` | GOT still holds the real libc pointer — lib was excluded or loaded too late. Benign. |
+| `auditSlotsChained`  | GOT points into some other library's executable region — a third-party hooker got there first. Not our crash. |
+| `auditSlotsCorrupt`  | **GOT points into `rw-p` data / `[anon:libc_malloc]` / unmapped memory** — xhook wrote to the wrong page. Forces `FAILED`. |
+| `auditHeapStubHits`  | A NetScope stub address was found sitting inside a rw-p anonymous heap page (i.e. xhook wrote into the host app's heap). Forces `FAILED`. |
+
+The audit also calls `xhook_clear()` which writes the pre-hook values back into every patched location; when the corruption happened into heap memory that hasn't been read yet, this typically undoes the damage before the host app crashes.
 
 ## API Reference
 
@@ -250,6 +265,14 @@ NetScope now **always calls the real libc** via `dlsym(RTLD_NEXT)` cached pointe
 Additionally, `xhook_refresh` (both the initial install and any dlopen-triggered refresh) is wrapped in a thread-local `sigsetjmp` / `SIGSEGV` handler: if xhook ever segfaults on a pathological vendor library, NetScope rolls back, flips status to `FAILED`, and the host app keeps running. The `SIGSEGV` handler chains back to the host's original signal handler for any segfault that isn't ours, so you don't lose tombstones from genuine app crashes.
 
 ## Known Limitations
+
+### Environmental
+
+- **`extractNativeLibs="false"` on some OEM ROMs** (most notably HONOR Android 10, Knox-derived builds): the bionic linker maps native libraries directly out of `base.apk` as multiple segments, each reporting a synthesized path like `base.apk!/lib/arm64-v8a/libX.so`. xhook 1.2.0's ELF parser has been observed to mis-compute GOT addresses for this layout, occasionally writing stub pointers into rw-p anonymous heap memory instead of real GOT slots — which corrupts a random C++ object and crashes the host app with `pc == x8` in `[anon:libc_malloc]`. NetScope's post-install audit detects this and self-disables (`Status.FAILED`). If you see `auditSlotsCorrupt > 0` or `auditHeapStubHits > 0`, either:
+  - Set `android:extractNativeLibs="true"` in your app's `AndroidManifest.xml`, or
+  - Ship a build of NetScope based on bytehook / shadowhook 2.x instead of xhook (work in progress; bytehook handles APK-embedded .so layouts explicitly).
+
+### Functional
 
 - **Per-connection count for open flows**: `connCountTotal` only counts **closed** connections. Long-lived TCP keep-alive / HTTP/2 streams show `conn=0` until they close, even though their bytes are counted.
 - **Custom close paths**: `close_range()` / `__close()` / `dup2()` on an active fd won't trigger our `close` hook. Byte counters remain correct (bytes are flushed per interval), but the corresponding `connCount` won't increment.

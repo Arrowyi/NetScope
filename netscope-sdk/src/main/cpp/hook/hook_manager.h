@@ -14,13 +14,30 @@ enum HookStatus : int32_t {
 
 // Detailed report of which hooks succeeded. Used by the JNI bridge to build
 // a Kotlin HookReport data class.
+//
+// Fields after `close_ok` are populated by got_audit() after xhook_refresh
+// and let the upper layer distinguish "xhook accepted every register call"
+// from "xhook actually wrote the right pointer into the right GOT slot".
+// On some ROMs (notably HONOR Android 10 with extractNativeLibs=false)
+// xhook 1.2.0 mis-computes the GOT address for APK-embedded .so files and
+// ends up writing our stub pointer into a heap word, corrupting a random
+// C++ object. The post-install audit detects this and flips us to FAILED.
 struct HookReport {
     HookStatus status;
-    bool libc_resolved;   // all 12 libc symbols resolved via dlsym
+    bool libc_resolved;        // all 12 libc symbols resolved via dlsym
     bool connect_ok;
     bool dns_ok;
     bool send_recv_ok;
     bool close_ok;
+
+    // Post-install GOT audit results (zero iff audit didn't run).
+    int  audit_slots_total;        // relocations matching hooked symbols
+    int  audit_slots_hooked;       // pointing to our stub (correct)
+    int  audit_slots_unhooked;     // pointing to real libc (lib not patched)
+    int  audit_slots_chained;      // pointing to another lib's .text
+    int  audit_slots_corrupt;      // pointing to rw-p data / unmapped (BAD)
+    int  audit_heap_stub_hits;     // stub addresses found in rw-p anon heap (BAD)
+
     // Short human-readable description of why the SDK is DEGRADED / FAILED.
     // Empty when status == ACTIVE.
     char failure_reason[256];

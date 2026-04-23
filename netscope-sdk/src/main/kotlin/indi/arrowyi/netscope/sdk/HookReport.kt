@@ -24,9 +24,18 @@ enum class Status(val nativeValue: Int) {
     DEGRADED(2),
 
     /**
-     * A critical failure occurred (e.g. SIGSEGV during xhook_refresh, or
-     * libc symbol resolution failed). No traffic data will be collected
-     * for this process. Prompt the user / log to crashlytics.
+     * A critical failure occurred:
+     * - SIGSEGV during xhook_refresh, or
+     * - libc symbol resolution failed, or
+     * - **the post-install audit detected that GOT writes landed in
+     *   non-executable memory** (typical on HONOR Android 10 with
+     *   `extractNativeLibs=false`, where xhook 1.2.0 mis-parses the
+     *   APK-embedded .so layout and writes stub pointers into random
+     *   heap pages — see [HookReport.auditSlotsCorrupt] and
+     *   [HookReport.auditHeapStubHits]).
+     *
+     * No traffic data will be collected for this process. Prompt the
+     * user / log to crashlytics.
      */
     FAILED(3);
 
@@ -38,18 +47,29 @@ enum class Status(val nativeValue: Int) {
 }
 
 /**
- * Detailed snapshot of which hooks succeeded. Constructed by the native
- * layer — DO NOT change the constructor signature without also updating
- * `build_hook_report()` in netscope_jni.cpp.
+ * Detailed snapshot of hook installation + post-install audit results.
  *
- * @param statusCode     raw enum value; use [status] for the typed form
- * @param libcResolved   `true` iff all critical libc functions were resolved via dlsym
- * @param connectOk      `true` iff connect() hook registered without error
- * @param dnsOk          `true` iff getaddrinfo() hook registered without error
- * @param sendRecvOk     `true` iff all send/recv/write/read hooks registered
- * @param closeOk        `true` iff close() hook registered without error
- * @param failureReason  empty when [status] is ACTIVE; otherwise a short
- *                       machine-readable reason suitable for logging
+ * DO NOT reorder constructor parameters without also updating the JNI
+ * signature in `netscope_jni.cpp::build_hook_report`.
+ *
+ * @param statusCode          raw enum value; use [status] for the typed form
+ * @param libcResolved        `true` iff all critical libc functions resolved via dlsym
+ * @param connectOk           `true` iff connect() hook registered without error
+ * @param dnsOk               `true` iff getaddrinfo() hook registered without error
+ * @param sendRecvOk          `true` iff all send/recv/write/read hooks registered
+ * @param closeOk             `true` iff close() hook registered without error
+ * @param auditSlotsTotal     GOT relocations matching our hooked symbols across all loaded .so
+ * @param auditSlotsHooked    of those, how many currently point to a NetScope stub (good)
+ * @param auditSlotsUnhooked  of those, how many still point at the real libc symbol (benign)
+ * @param auditSlotsChained   of those, how many point into some OTHER library's code
+ *                            (a third-party hooker got there first — not a crash risk)
+ * @param auditSlotsCorrupt   of those, how many point into rw-p data / non-executable memory —
+ *                            **nonzero means xhook misrouted a write** and forces FAILED
+ * @param auditHeapStubHits   how many stub addresses were found floating in rw-p anonymous
+ *                            heap memory (smoking-gun for the xhook+APK-embedded bug);
+ *                            **nonzero forces FAILED**
+ * @param failureReason       empty when [status] is ACTIVE; otherwise a short
+ *                            machine-readable reason suitable for logging
  */
 data class HookReport(
     val statusCode: Int,
@@ -58,10 +78,25 @@ data class HookReport(
     val dnsOk: Boolean,
     val sendRecvOk: Boolean,
     val closeOk: Boolean,
+    val auditSlotsTotal: Int,
+    val auditSlotsHooked: Int,
+    val auditSlotsUnhooked: Int,
+    val auditSlotsChained: Int,
+    val auditSlotsCorrupt: Int,
+    val auditHeapStubHits: Int,
     val failureReason: String?
 ) {
     val status: Status get() = Status.fromNative(statusCode)
 
     /** Will traffic data be collected at all? False only when FAILED or NOT_INITIALIZED. */
     val isCollecting: Boolean get() = status == Status.ACTIVE || status == Status.DEGRADED
+
+    /**
+     * True iff the post-install audit found at least one GOT slot that
+     * xhook wrote into non-executable memory, or at least one stub
+     * address lurking in the heap. These are the indicators for the
+     * HONOR Android 10 / xhook 1.2.0 / extractNativeLibs=false crash
+     * scenario. When true the SDK has already self-disabled.
+     */
+    val auditFoundCorruption: Boolean get() = auditSlotsCorrupt > 0 || auditHeapStubHits > 0
 }

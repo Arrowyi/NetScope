@@ -4,6 +4,7 @@
 #include "hook_send_recv.h"
 #include "hook_close.h"
 #include "libc_funcs.h"
+#include "got_audit.h"
 #include "../netscope_log.h"
 #include "xhook.h"
 #include <android/dlext.h>
@@ -140,6 +141,11 @@ static void install_sigsegv_guard() {
 // Cover libraries loaded after init. Guarded by SIGSEGV handler above.
 
 static void refresh_hooks_for_new_lib(const char* filename) {
+    // If the initial post-install audit already flipped us to FAILED we
+    // MUST NOT call xhook_refresh again — every refresh on this ROM can
+    // corrupt more heap memory (see audit logic in hook_manager_init).
+    if (g_status.load() == HOOK_STATUS_FAILED) return;
+
     if (g_refresh_in_progress.exchange(true)) return;
     LOGD("hook_manager: '%s' loaded, refreshing GOT hooks",
          filename ? filename : "(null)");
@@ -203,6 +209,12 @@ int hook_manager_init() {
     // initial refresh hits a bad library.
     install_sigsegv_guard();
 
+    // xhook 1.2.0 ships its own best-effort SIGSEGV handler around GOT
+    // mprotect/write. It's cheap and independent from our own guard — turn
+    // it on so at least xhook can skip problem libs before our handler
+    // would see the signal.
+    xhook_enable_sigsegv_protection(1);
+
     // Register hooks (patterns only; xhook_refresh below applies them).
     int fail_connect    = install_hook_connect();
     int fail_dns        = install_hook_dns();
@@ -251,19 +263,80 @@ int hook_manager_init() {
     verify_hook_send_recv();
     verify_hook_close();
 
+    // ── Post-install audit ─────────────────────────────────────────────────
+    //
+    // xhook 1.2.0 has been observed (HONOR Android 10, APK-embedded .so
+    // layouts from extractNativeLibs=false) to silently write our stub
+    // address into the WRONG memory page — typically into a rw-p anonymous
+    // heap region. xhook_register then returns 0 ("success"), xhook_refresh
+    // returns 0 ("success"), but the actual GOT entry for e.g. `connect`
+    // remains unchanged in its proper slot while our stub pointer is
+    // deposited somewhere inside the host app's heap. The first time the
+    // host app uses whatever C++ object that heap word belongs to, it
+    // segfaults with pc == x8 in [anon:libc_malloc].
+    //
+    // We now walk every loaded .so's PLT relocations ourselves and read
+    // the real current GOT values back. If any of our target symbols
+    // resolves to a non-executable page (definite corruption) or if the
+    // heap scan finds stub addresses hiding in rw-p anonymous memory,
+    // we roll everything back and flip the SDK to FAILED so the host
+    // app's HMI can surface "traffic monitoring disabled".
+    //
+    // xhook_clear() writes the original pre-hook values back into every
+    // location xhook patched — so if the corruption happened into heap
+    // memory that hasn't been read yet, this call typically undoes the
+    // damage. Our state flips to FAILED either way.
+    GotAuditResult audit = audit_got(/*scan_anon_heap=*/true);
+    {
+        std::lock_guard<std::mutex> lock(g_report_mutex);
+        g_report.audit_slots_total    = audit.slots_total;
+        g_report.audit_slots_hooked   = audit.slots_to_our_stub;
+        g_report.audit_slots_unhooked = audit.slots_to_real_libc;
+        g_report.audit_slots_chained  = audit.slots_to_other_text;
+        g_report.audit_slots_corrupt  = audit.slots_corrupt;
+        g_report.audit_heap_stub_hits = audit.anon_stub_hits;
+    }
+
+    const bool audit_corrupt = (audit.slots_corrupt > 0) || (audit.anon_stub_hits > 0);
+    if (audit_corrupt) {
+        LOGE("hook_manager_init: GOT audit detected corruption — "
+             "rolling back. corrupt_slots=%d heap_hits=%d first=%s",
+             audit.slots_corrupt, audit.anon_stub_hits,
+             audit.first_detail[0] ? audit.first_detail : "(none)");
+        // Undo whatever xhook wrote (including any wrong writes), then
+        // clear our registrations so dlopen-driven refreshes stop.
+        xhook_clear();
+        t_in_refresh = true;
+        if (sigsetjmp(t_refresh_jmp, 1) == 0) xhook_refresh(0);
+        t_in_refresh = false;
+
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "post-install audit: %s (corrupt_slots=%d heap_hits=%d)",
+                      audit.first_detail[0] ? audit.first_detail
+                                            : "stub found in non-executable memory",
+                      audit.slots_corrupt, audit.anon_stub_hits);
+        set_status(HOOK_STATUS_FAILED, buf);
+        return -3;
+    }
+
     const int total_failures = fail_connect + fail_dns + fail_send_recv + fail_close;
-    if (total_failures == 0 && libc_complete) {
+    if (total_failures == 0 && libc_complete && audit.slots_to_our_stub > 0) {
         set_status(HOOK_STATUS_ACTIVE);
-        LOGI("hook_manager_init: all hooks installed, status=ACTIVE");
+        LOGI("hook_manager_init: ACTIVE (audit: %d/%d slots hooked, %d libc, %d chained)",
+             audit.slots_to_our_stub, audit.slots_total,
+             audit.slots_to_real_libc, audit.slots_to_other_text);
     } else {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-                      "partial hooks: connect=%s dns=%s send_recv=%s close=%s libc=%d/12",
+                      "partial hooks: connect=%s dns=%s send_recv=%s close=%s libc=%d/12 "
+                      "audit slots=%d hooked=%d",
                       fail_connect   ? "FAIL" : "ok",
                       fail_dns       ? "FAIL" : "ok",
                       fail_send_recv ? "FAIL" : "ok",
                       fail_close     ? "FAIL" : "ok",
-                      libc_ok);
+                      libc_ok,
+                      audit.slots_total, audit.slots_to_our_stub);
         set_status(HOOK_STATUS_DEGRADED, buf);
         LOGW("hook_manager_init: %s", buf);
     }
