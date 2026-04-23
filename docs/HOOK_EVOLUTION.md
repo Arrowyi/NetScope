@@ -11,27 +11,40 @@ pitfalls otherwise.
 |-------|----------------------|-----------------|------------------------------------------------|
 | 1     | shadowhook 1.0.9     | earliest alpha  | inline-hook trampolines need `mmap(PROT_EXEC)` |
 | 2     | shadowhook 2.0.0     | `22bc487`       | same W^X problem on HONOR Android 10           |
-| 3     | bytehook (bhook)     | `eeaf53f`       | same `mmap(PROT_EXEC)` trampoline crash on W^X ROMs |
+| 3     | bytehook (bhook) 1.1.1 | `eeaf53f`     | **AUTOMATIC mode + `BYTEHOOK_CALL_PREV`** triggers `bh_hub_init` → `bh_trampo_alloc` → `mmap(PROT_EXEC)`; dies on W^X ROMs. The library is innocent — **the mode choice was wrong**. |
 | 4     | xhook 1.2.0          | `8934473`       | mis-computes GOT addresses for APK-embedded and some extracted `.so` — stub pointers land in `[anon:libc_malloc]` pages, app crashes minutes later in unrelated virtual calls |
-| 5     | bytehook 1.1.1 (retry) | _this commit_ | _TBD — W^X on strict car head-units to be re-tested_ |
+| 5     | bytehook 1.1.1 (retry) | `68acdfb`     | shipping. Same library as order 3, but now in **`BYTEHOOK_MODE_MANUAL`** with `libc().fn()` calls (no `CALL_PREV`). MANUAL mode's hook path (`bh_switch_hook_unique`, `hub_trampo=NULL`) never reaches `bh_trampo_alloc`, so W^X is structurally unreachable. |
 
 ## Core problems we keep hitting
 
 ### P1. W^X (Write-XOR-Execute) on locked-down Android ROMs
 
-- **Symptom:** `mmap(len, PROT_READ|PROT_EXEC, ...)` returns `EPERM` or the
+- **Symptom:** `mmap(len, PROT_READ|PROT_WRITE|PROT_EXEC, ...)` returns
+  `EPERM`, or the allocator silently falls back to `malloc` and the
   kernel kills the process with `SIGSEGV` the moment a newly-allocated
   trampoline is executed.
 - **Who triggers it:** shadowhook (inline), bytehook _AUTOMATIC_ mode
-  (shared trampoline page for `BYTEHOOK_CALL_PREV`).
+  (shared trampoline page for `BYTEHOOK_CALL_PREV`). Pinpointed via
+  source reading (`bh_trampo.c:82` is the only `mmap(PROT_EXEC)` call
+  in all of bytehook; only reachable from `bh_hub_create`; only
+  reachable in AUTOMATIC mode or via explicit `BYTEHOOK_CALL_PREV`).
+- **Who does NOT trigger it:** bytehook in **`BYTEHOOK_MODE_MANUAL`**
+  when proxies call the real libc via `libc().fn()` (resolved by
+  `dlsym(RTLD_NEXT)`) instead of `BYTEHOOK_CALL_PREV`. The MANUAL code
+  path routes through `bh_switch_hook_unique(..., hub_trampo=NULL)`,
+  which never calls `bh_hub_create`, which never calls
+  `bh_trampo_alloc`. Verified across bytehook versions 1.0.x – 1.1.1.
 - **Devices seen:** HONOR Android 10, some OEM car head-units (IVI).
-- **Mitigation:** prefer pure **PLT/GOT patching** (no EXEC allocation
-  needed — we only `mprotect(GOT_PAGE, RW)` → store → `mprotect(GOT_PAGE, R)`).
-- **With bytehook:** use **`BYTEHOOK_MODE_MANUAL`** and do **not** call
-  `BYTEHOOK_CALL_PREV` in proxies. That removes bytehook's trampoline
-  allocation from the critical path on init. If the OEM device still fails
-  at `bytehook_init`, surface it via `HookStatus.FAILED` with a clear reason
-  — **do not try to retry or recover with executable allocations**.
+- **The source of bytehook (Prefab AAR vs vendored C sources) is
+  irrelevant to W^X safety.** Both paths ship the identical object
+  code; only the init flags and the proxy code decide whether
+  `bh_trampo_alloc` is reached.
+- **Mitigation:** use **`BYTEHOOK_MODE_MANUAL`** and do **not** call
+  `BYTEHOOK_CALL_PREV` in proxies. If `bytehook_init` ever returns
+  `INITERR_TRAMPO` / `INITERR_HUB` despite MANUAL mode, that is a
+  bytehook version regression — surface the numeric code via
+  `HookStatus.FAILED` with a clear reason; **do not retry with
+  executable allocations**.
 
 ### P2. `orig_*` pointers chain into host app's hook stubs
 
@@ -127,19 +140,41 @@ pitfalls otherwise.
 - **Invariant:** if you switch hooker again and the new one doesn't
   handle late-loaded libs, bring the dlopen-hook code back in.
 
-### P8. Trampoline-based hookers are fundamentally incompatible with strict W^X
+### P8. Trampoline-based hooker modes are incompatible with strict W^X
 
-- You cannot `mmap(PROT_EXEC)` on an IVI kernel that enforces W^X.
-- shadowhook (inline) is therefore permanently off the table.
-- bytehook is OK in **MANUAL mode only** as long as proxies don't use
-  `BYTEHOOK_CALL_PREV`.
-- If a future requirement forces us to call the previous hook in a
-  chain, we have no viable hooker for W^X devices. Plan around this.
+- You cannot `mmap(PROT_READ|PROT_WRITE|PROT_EXEC, MAP_ANONYMOUS, ...)`
+  on an IVI kernel that enforces W^X / SELinux `execmem` deny.
+- Any hooker that _executes on a freshly-allocated anonymous page_ is
+  blocked:
+  - shadowhook (inline): every hook needs a trampoline; permanently
+    off the table for these devices.
+  - bytehook **AUTOMATIC**: the shared hub page used by
+    `BYTEHOOK_CALL_PREV` is allocated this way. See `bh_trampo.c:82`.
+- Hookers that only _modify existing executable pages_ are fine,
+  because `mprotect` to temporarily add `PROT_WRITE` to a page that
+  was already mapped `PROT_READ|PROT_EXEC` is a different syscall
+  with a different policy gate (usually allowed):
+  - xhook (GOT patch): fine on W^X, dies from its own ELF-parsing bug
+    — that's P3, unrelated.
+  - bytehook **MANUAL** + `libc().fn()`: also fine on W^X, because
+    it's pure GOT patching too; no anonymous PROT_EXEC page is ever
+    allocated.
+- If a future requirement forces `BYTEHOOK_CALL_PREV` (hook chaining),
+  we have no viable hooker for W^X devices out of the box. Plan
+  around this: either resolve the previous hook yourself via
+  `dlsym(RTLD_NEXT)`, or vendor bytehook and replace `bh_trampo_alloc`
+  with a `memfd_create`-backed dual-mapping implementation (≈ 1 day
+  of focused work; see P1 fallback plan).
 
 ## Golden rules (DO NOT violate without updating this file)
 
 1. **Never call `orig_*` / `BYTEHOOK_CALL_PREV` in a proxy.** Always
-   `libc().<fn>()`.
+   `libc().<fn>()`. This also keeps bytehook in the MANUAL-mode
+   code path (`bh_switch_hook_unique`), which is the reason we don't
+   need `mmap(PROT_EXEC)` and therefore don't hit W^X. See P1.
+   Corollary: **never flip `bytehook_init` to `BYTEHOOK_MODE_AUTOMATIC`**
+   without first replacing `bh_trampo_alloc` with a W^X-safe
+   dual-mapping implementation.
 2. **Never mark a pointer as "our stub" via range check.** Use the
    exact-match set in `hook_stubs.{h,cpp}` (one entry per
    `bytehook_hook_all`/`xhook_register` call).
@@ -162,26 +197,39 @@ pitfalls otherwise.
 
 ## Known-good configurations
 
-| Android | OEM                 | Packaging                 | Hooker            | Status |
-|---------|---------------------|---------------------------|-------------------|--------|
-| 10      | HONOR AGM3-W09HN    | extractNativeLibs=false   | xhook 1.2.0       | stub writes into heap → crash |
-| 10      | HONOR AGM3-W09HN    | extractNativeLibs=true    | xhook 1.2.0       | crash 16–25 s later            |
-| 13      | Generic tablet      | either                    | xhook 1.2.0       | stable                         |
-| 10      | HONOR AGM3-W09HN    | either                    | bytehook 1.1.1    | _testing now_                  |
-| IVI     | OEM car head-unit   | either                    | bytehook 1.1.1    | _W^X risk — to be tested_      |
+| Android | OEM                 | Packaging                 | Hooker / mode                  | Status |
+|---------|---------------------|---------------------------|--------------------------------|--------|
+| 10      | HONOR AGM3-W09HN    | extractNativeLibs=false   | xhook 1.2.0                    | stub writes into heap → crash |
+| 10      | HONOR AGM3-W09HN    | extractNativeLibs=true    | xhook 1.2.0                    | crash 16–25 s later |
+| 13      | Generic tablet      | either                    | xhook 1.2.0                    | stable |
+| 10      | HONOR AGM3-W09HN    | either                    | bytehook 1.1.1 / AUTOMATIC     | crashes — W^X (`eeaf53f`, historical) |
+| 10      | HONOR AGM3-W09HN    | either                    | bytehook 1.1.1 / **MANUAL**    | _testing `68acdfb`_ |
+| IVI     | OEM car head-unit   | either                    | bytehook 1.1.1 / **MANUAL**    | _W^X structurally unreachable; field-testing `68acdfb`_ |
 
 ## If bytehook 1.1.1 fails
 
 Order of fallback plans:
 
-1. **`bytehook_init` fails with INITERR_TRAMPO (code 8) or INITERR_HUB
-   (27):** we've hit W^X. Roll back to the `6f50453` xhook path and
-   document the device as unsupported.
-2. **bytehook installs but we see same `[anon:libc_malloc]` stub-write
+1. **`bytehook_init` returns `INITERR_TRAMPO` (8) or `INITERR_HUB`
+   (27):** should never happen under MANUAL mode (those codes sit
+   behind `bh_hub_init`, which AUTOMATIC-only). If you see them:
+   either someone flipped the mode back to AUTOMATIC, or the bytehook
+   source drifted. Inspect the `g_report.failure_reason` string — it
+   carries the numeric code.
+2. **`bytehook_init` returns `INITERR_CFI` (10):** the OEM refuses to
+   `mprotect(RWX)` on libdl's `__cfi_slowpath`. Traffic collection
+   still works but CFI-protected callers won't go through our proxy.
+   Surface as `DEGRADED`, do not roll back.
+3. **bytehook installs but we see same `[anon:libc_malloc]` stub-write
    crashes:** unlikely given its test coverage, but the escape hatch is
    to write our own minimal PLT patcher — we already have all the ELF
    parsing in `got_audit.cpp`. Estimated ≤ 300 LOC.
-3. **bytehook installs and audit is clean but traffic still doesn't
+4. **bytehook installs and audit is clean but traffic still doesn't
    flow:** check `HookReport.audit.slots_hooked` vs `slots_total`. If
    `slots_hooked == 0`, bytehook's `hook_all` silently no-op'd; likely
    a `bytehook_add_ignore` of the wrong path.
+5. **Need `BYTEHOOK_CALL_PREV` semantics in the future:** vendor
+   bytehook and replace `bh_trampo_alloc` with a dual-mapping version
+   (`memfd_create` → `mmap(RW)` alias + `mmap(RX)` alias backed by the
+   same fd). Do **not** try to flip AUTOMATIC mode on without this
+   change — it will W^X-crash on the car head-units. See P8.
