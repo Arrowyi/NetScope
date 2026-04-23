@@ -55,9 +55,10 @@ struct HookReport {
 // specific OEM devices. Never ship with SKIP_HOOKS enabled — it disables
 // all traffic collection. See also NetScope.setDebugMode() in Kotlin and
 // README.md "Diagnostic mode" section.
-constexpr int DEBUG_NONE        = 0;
-constexpr int DEBUG_TRACE_HOOKS = 1 << 0;  // per-write log + bytehook debug logs
-constexpr int DEBUG_SKIP_HOOKS  = 1 << 1;  // init bytehook but register no stubs
+constexpr int DEBUG_NONE          = 0;
+constexpr int DEBUG_TRACE_HOOKS   = 1 << 0;  // per-write log + bytehook debug logs
+constexpr int DEBUG_SKIP_HOOKS    = 1 << 1;  // init bytehook but register no stubs
+constexpr int DEBUG_ULTRA_MINIMAL = 1 << 2;  // resolve libc only; DO NOT call bytehook_init
 
 // Must be called before hook_manager_init(); changes after init are ignored.
 void hook_manager_set_debug_flags(int flags);

@@ -206,20 +206,24 @@ NetScope.init(this)
 | Flag | Effect | Safe for production? |
 |---|---|---|
 | `DEBUG_NONE` | Default. No extra logs. | ✔ |
-| `DEBUG_TRACE_HOOKS` | For each GOT write bytehook performs, log `{caller_lib, symbol, prev_func, new_func}`. If `prev_func` doesn't match the `dlsym(RTLD_NEXT)`-resolved real libc pointer, log `CONTESTED` — another PLT/GOT hooker was already active in that library. Also turns on bytehook's own `debug` stream (tag `bytehook`) and `bytehook_set_recordable(true)`. | ✔ (verbose logs only) |
+| `DEBUG_TRACE_HOOKS` | For each GOT write bytehook performs, log `{caller_lib, symbol, prev_func, new_func}`. If `prev_func` doesn't match the `dlsym(RTLD_NEXT)`-resolved real libc pointer, log `CONTESTED` — another PLT/GOT hooker was already active in that library. Also turns on bytehook's own `debug` stream (tag `bytehook`) and `bytehook_set_recordable(true)`. Additionally snapshots `/proc/self/maps` + 32 bytes at well-known libc/libdl entry points (including `__cfi_slowpath`) BEFORE and AFTER `bytehook_init`, logging any VMA or byte-level diff as `init-diff: ...`. | ✔ (verbose logs only) |
 | `DEBUG_SKIP_HOOKS` | `bytehook_init` still runs (CFI disable, shadowhook trampoline registration, the whole load path) — but NetScope installs ZERO stubs. `HookReport.status = DEGRADED`, `failureReason = "diagnostic: DEBUG_SKIP_HOOKS — bytehook initialised (...), no stubs registered"`. **Traffic is NOT collected.** | ✖ diagnostic only |
+| `DEBUG_ULTRA_MINIMAL` | Most aggressive. Resolves libc via `dlsym(RTLD_NEXT)` (passive; no writes) and **does not call `bytehook_init` at all**. `HookReport.status = DEGRADED`, `failureReason = "diagnostic: DEBUG_ULTRA_MINIMAL — libc resolved (N/11) but bytehook_init NOT called"`. If the app still crashes in this mode, NetScope's runtime did literally nothing beyond `dlsym` — the trigger must be something merely loading `libnetscope.so` brings into the process. **Traffic is NOT collected.** | ✖ diagnostic only |
 
 ### Recommended recipe for a crashing device
 
-Ship ONE APK with a build-config toggle so QA can flip between these three modes at runtime (e.g. via a hidden developer-options switch) and collect logcat for each:
+Ship ONE APK with a build-config toggle so QA can flip between these modes at runtime (e.g. via a hidden developer-options switch) and collect logcat for each. Walk the ladder from "most-like-production" to "literally nothing":
 
-1. **Build A — trace everything.** `setDebugMode(DEBUG_TRACE_HOOKS)`. Grep logcat for `bytehook-trace: CONTESTED ...`. If you see contested slots in the library whose thread later crashes (e.g. `libasdk.so`, `libhttpclient_asdk.so`), the crash is a **hooker conflict** — the host app's own hooker trampolines are in the middle of the call path. Mitigations:
-   - `bytehook_add_ignore("<host-app-hook-lib>.so")` to skip patching that specific library, and/or
-   - coordinate with the host-app team on load order so their hooker initialises *after* ours.
+1. **Build A — trace everything.** `setDebugMode(DEBUG_TRACE_HOOKS)`. All hooks installed plus full before/after diff. Grep logcat for:
+   - `bytehook-trace: CONTESTED ...` — another hooker got to a library first.
+   - `init-diff: ... CHANGED` — specific byte sequences that bytehook's init rewrote; usually the only expected hit is `libdl.so!__cfi_slowpath`. Anything else changing (e.g. `libart.so` symbols) is a shadowhook pattern-match misfire — file the line back.
+   - `init-diff: +vma ...` — new `.so` or anon mappings that appeared during init.
 
-2. **Build B — bytehook init only, no writes.** `setDebugMode(DEBUG_SKIP_HOOKS)`. If the app *still* crashes, NetScope's hook installation is not the trigger — merely loading and initialising bytehook on this device is incompatible with the host app's native stack. In that case the fix lives one layer down (disable CFI-disable, run without shadowhook, or switch to a raw PLT patcher). File an issue with the logcat and we will evaluate.
+2. **Build B — bytehook init only, no writes.** `setDebugMode(DEBUG_SKIP_HOOKS)`. Isolates the bytehook-init side effects (CFI disable, shadowhook trampolines) from NetScope's own GOT writes. If the app crashes here but not in Build A, GOT writes are compensating; usually the other way around.
 
-3. **Build C — both flags.** `setDebugMode(DEBUG_TRACE_HOOKS or DEBUG_SKIP_HOOKS)`. Same as Build B but bytehook's own debug logs are on, so you can see exactly when/how bytehook's init path touches each library even though no stubs exist.
+3. **Build C — do not even call bytehook_init.** `setDebugMode(DEBUG_ULTRA_MINIMAL)`. The last remaining thing NetScope's runtime does is `dlsym(RTLD_NEXT)` on ~11 libc symbols, which is pure read-only linker work. If the app STILL crashes in this mode, NetScope's *runtime* is not the trigger — the culprit is static-init code that loading `libnetscope.so` (via its `DT_NEEDED` on `libbytehook.so`) drags into the process. If the app stops crashing, the trigger is pinned to `bytehook_init`.
+
+4. **Build D — trace + minimal.** `setDebugMode(DEBUG_TRACE_HOOKS or DEBUG_ULTRA_MINIMAL)`. Enables the VMA + byte-probe diff in Build C mode, so you can see what (if anything) merely *loading* the SDK does to `/proc/self/maps` vs. what `bytehook_init` adds on top.
 
 ### What the HMI agent should collect
 
@@ -237,6 +241,16 @@ W NetScope: bytehook-trace: CONTESTED lib=/data/app/.../libasdk_httpclient.so sy
 ```
 
 A line like that, immediately followed by a tombstone in that same library's thread, is conclusive evidence for Build A's hooker-conflict hypothesis.
+
+And an `init-diff` line showing a byte mismatch outside `libdl.so!__cfi_slowpath` looks like:
+
+```
+W NetScope: init-diff: libart.so!art_jni_dlsym_lookup_stub @ 0x789c0a14c0 CHANGED
+W NetScope: init-diff:   before: fd 7b bf a9 fd 03 00 91 ff 43 01 d1 e0 03 00 aa ...
+W NetScope: init-diff:   after : 00 02 00 d4 ff 43 01 d1 e0 03 00 aa 00 00 00 00 ...
+```
+
+The first four bytes changing to `00 02 00 d4` (an `SVC #0x10` / `BRK` sequence) would be conclusive evidence that bytehook's shadowhook backend patched an ART internal function it shouldn't have — file the line back and we will investigate a PLT-only backend.
 
 ### Turning diagnostic mode off
 

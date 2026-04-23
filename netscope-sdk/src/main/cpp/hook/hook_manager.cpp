@@ -9,6 +9,8 @@
 #include "../netscope_log.h"
 #include "bytehook.h"
 
+#include <dlfcn.h>
+#include <unistd.h>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -16,6 +18,8 @@
 #include <csetjmp>
 #include <cerrno>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 
 namespace netscope {
 
@@ -172,6 +176,182 @@ static void install_sigsegv_guard() {
 // path — that would be a regression on our side (we should always be in
 // MANUAL), not a platform problem.
 
+// ─── bytehook_init side-effect diff logger ─────────────────────────────────
+//
+// Gated on DEBUG_TRACE_HOOKS (same switch as the per-write trace). When on,
+// we snapshot the process state BEFORE calling bytehook_init() and AFTER,
+// then log:
+//
+//   (a) New VMAs that appeared in /proc/self/maps (which .so got loaded,
+//       which anon/exec pages got allocated).
+//   (b) The first 32 bytes at a handful of well-known symbols NEEDED by
+//       ART JNI dispatch + known shadowhook patch sites. Any byte that
+//       changed between the two snapshots is spelled out in hex.
+//
+// The HONOR AGM3-W09HN + EMUI 11 / Magic UI 4.0 triage showed bytehook_init
+// itself is the trigger (DEBUG_SKIP_HOOKS still crashes), so the before/
+// after diff pinpoints which code bytes the bytehook-embedded shadowhook
+// backend actually rewrites on this ROM.
+//
+// See HMI's CONSOLIDATED_ROOT_CAUSE_REPORT.md (2026-04-23) for the
+// motivating crash-fingerprint analysis.
+
+namespace {
+
+struct ProbeTarget {
+    const char* lib;    // for logging
+    const char* sym;    // dlsym'd via RTLD_DEFAULT
+    void*       addr;   // resolved once, cached
+    uint8_t     before[32];
+    bool        captured;
+};
+
+// Symbols picked specifically to cover the layers bytehook_init touches:
+//   - libdl.so!__cfi_slowpath       – the documented shadowhook patch site
+//                                     for bytehook's CFI-disable path
+//   - libdl.so!dlopen               – bytehook hooks this to intercept
+//                                     late-loaded libraries
+//   - libdl.so!android_dlopen_ext   – modern variant of the above
+//   - libc.so!abort / raise         – bh_safe_init uses shadowhook to
+//                                     install signal handlers; any stray
+//                                     inline hook here would show up
+//   - libc.so!malloc / free         – hot ART JNI path; used to confirm
+//                                     ART heap allocation isn't a victim
+//   - libc.so!connect / send        – sanity, we should see no change here
+static ProbeTarget g_probes[] = {
+    {"libdl.so", "__cfi_slowpath",     nullptr, {}, false},
+    {"libdl.so", "dlopen",             nullptr, {}, false},
+    {"libdl.so", "android_dlopen_ext", nullptr, {}, false},
+    {"libc.so",  "abort",              nullptr, {}, false},
+    {"libc.so",  "raise",              nullptr, {}, false},
+    {"libc.so",  "malloc",             nullptr, {}, false},
+    {"libc.so",  "free",               nullptr, {}, false},
+    {"libc.so",  "connect",            nullptr, {}, false},
+    {"libc.so",  "send",               nullptr, {}, false},
+    {"libc.so",  "pthread_create",     nullptr, {}, false},
+};
+
+static std::unordered_map<std::string, std::string> g_maps_before;
+
+// Capture a 32-byte window starting at `addr` into `out`. Returns false
+// if the page isn't readable (we don't SIGSEGV — we just skip).
+static bool safe_copy32(const void* addr, uint8_t* out) {
+    if (!addr) return false;
+    // Best-effort: if the page isn't mapped readable, memcpy will fault.
+    // We rely on /proc/self/maps having already classified addr's page
+    // before reaching here; the dlsym'd symbol addresses are in .text of
+    // public libs which are always r-xp. No fault expected in practice.
+    std::memcpy(out, addr, 32);
+    return true;
+}
+
+static void capture_probes_before() {
+    for (auto& p : g_probes) {
+        p.addr = dlsym(RTLD_DEFAULT, p.sym);
+        if (!p.addr) continue;
+        if (safe_copy32(p.addr, p.before)) p.captured = true;
+    }
+}
+
+static void format_bytes32(const uint8_t* b, char* out, size_t cap) {
+    // "aa bb cc dd ee ff ..." — 32 bytes → 96 chars + NUL
+    size_t pos = 0;
+    for (int i = 0; i < 32 && pos + 4 < cap; ++i) {
+        pos += std::snprintf(out + pos, cap - pos, "%02x%s",
+                             b[i], i == 31 ? "" : " ");
+    }
+    if (pos < cap) out[pos] = '\0';
+}
+
+static void log_probes_after_diff() {
+    for (auto& p : g_probes) {
+        if (!p.captured || !p.addr) {
+            LOGI("init-diff: skip %s!%s (addr=%p captured=%d)",
+                 p.lib, p.sym, p.addr, (int)p.captured);
+            continue;
+        }
+        uint8_t after[32];
+        if (!safe_copy32(p.addr, after)) {
+            LOGW("init-diff: %s!%s unreadable after bytehook_init", p.lib, p.sym);
+            continue;
+        }
+        if (std::memcmp(p.before, after, 32) == 0) {
+            LOGI("init-diff: %s!%s @ %p UNCHANGED", p.lib, p.sym, p.addr);
+        } else {
+            char b_hex[128], a_hex[128];
+            format_bytes32(p.before, b_hex, sizeof(b_hex));
+            format_bytes32(after,    a_hex, sizeof(a_hex));
+            LOGW("init-diff: %s!%s @ %p CHANGED",      p.lib, p.sym, p.addr);
+            LOGW("init-diff:   before: %s",            b_hex);
+            LOGW("init-diff:   after : %s",            a_hex);
+        }
+    }
+}
+
+// Snapshot /proc/self/maps into a map {start_addr_hex -> whole line}.
+// We key on start address (stable across two calls within the same init
+// window) so the diff can spot BOTH new mappings and perm changes on
+// existing ones (e.g. r-xp → rwxp for a trampoline).
+static void capture_maps_into(std::unordered_map<std::string, std::string>& out) {
+    out.clear();
+    FILE* f = std::fopen("/proc/self/maps", "re");
+    if (!f) return;
+    char line[1024];
+    while (std::fgets(line, sizeof(line), f)) {
+        // Each line looks like "7a82310000-7a82320000 r-xp 00000000 ..."
+        // Take everything up to the first '-' as the key.
+        const char* dash = std::strchr(line, '-');
+        if (!dash) continue;
+        std::string key(line, dash - line);
+        // Strip trailing newline on value for cleaner logs.
+        size_t n = std::strlen(line);
+        if (n && line[n - 1] == '\n') line[n - 1] = '\0';
+        out.emplace(std::move(key), std::string(line));
+    }
+    std::fclose(f);
+}
+
+static void log_maps_diff() {
+    std::unordered_map<std::string, std::string> after;
+    capture_maps_into(after);
+
+    // New (not in before)
+    int new_count = 0;
+    for (const auto& kv : after) {
+        if (g_maps_before.find(kv.first) == g_maps_before.end()) {
+            LOGW("init-diff: +vma %s", kv.second.c_str());
+            ++new_count;
+        }
+    }
+    // Changed perms (same key, different line)
+    int changed_count = 0;
+    for (const auto& kv : after) {
+        auto it = g_maps_before.find(kv.first);
+        if (it != g_maps_before.end() && it->second != kv.second) {
+            LOGW("init-diff: ~vma before: %s", it->second.c_str());
+            LOGW("init-diff: ~vma after : %s", kv.second.c_str());
+            ++changed_count;
+        }
+    }
+    LOGI("init-diff: maps summary: +%d new, %d changed (before=%zu after=%zu)",
+         new_count, changed_count, g_maps_before.size(), after.size());
+}
+
+static void init_diff_snapshot_before() {
+    capture_maps_into(g_maps_before);
+    capture_probes_before();
+    LOGI("init-diff: snapshot BEFORE bytehook_init — maps=%zu probes=%zu",
+         g_maps_before.size(), sizeof(g_probes) / sizeof(g_probes[0]));
+}
+
+static void init_diff_log_after() {
+    log_maps_diff();
+    log_probes_after_diff();
+    g_maps_before.clear();  // free memory after diffing
+}
+
+} // namespace
+
 static const char* bytehook_init_status_name(int code) {
     switch (code) {
         case BYTEHOOK_STATUS_CODE_OK:                return "OK";
@@ -198,8 +378,14 @@ static int init_bytehook_once() {
     if (prev == 1) return BYTEHOOK_STATUS_CODE_OK;
     if (prev == 2) return s_last_rc.load();
 
-    const bool bh_debug = (g_debug_flags.load() & DEBUG_TRACE_HOOKS) != 0;
+    const int  dbg      = g_debug_flags.load();
+    const bool bh_debug = (dbg & DEBUG_TRACE_HOOKS) != 0;
+    const bool diff_on  = (dbg & DEBUG_TRACE_HOOKS) != 0;  // reuse the trace switch
+
+    if (diff_on) init_diff_snapshot_before();
     int rc = bytehook_init(BYTEHOOK_MODE_MANUAL, /*debug=*/bh_debug);
+    if (diff_on) init_diff_log_after();
+
     s_last_rc.store(rc);
     s_done.store(rc == BYTEHOOK_STATUS_CODE_OK ? 1 : 2);
     LOGI("hook_manager: bytehook_init(MANUAL, debug=%s) = %d (%s), ver=%s",
@@ -237,6 +423,32 @@ int hook_manager_init() {
         set_status(HOOK_STATUS_FAILED,
                    "libc symbol resolution failed for one or more critical functions");
         return -1;
+    }
+
+    // DEBUG_ULTRA_MINIMAL: hard stop — do NOT call bytehook_init at all.
+    //
+    // This is the most aggressive diagnostic: everything up to here is
+    // pure dlsym(RTLD_NEXT) on libc.so (passive, no writes anywhere in
+    // the process). If the app still crashes with this flag set, the
+    // culprit is something loading libnetscope.so brought into the
+    // process — NOT anything NetScope does at runtime. If the app stops
+    // crashing, the culprit lives downstream of this line and is almost
+    // certainly inside bytehook_init's shadowhook-backed CFI-disable /
+    // safe-init paths.
+    //
+    // Added 2026-04-23 per HMI's HONOR AGM3-W09HN triage: DEBUG_SKIP_HOOKS
+    // (which leaves bytehook_init intact but registers zero stubs) still
+    // crashes with the same register fingerprint, so the trigger is
+    // proven to be inside bytehook_init. This flag splits that further.
+    if (g_debug_flags.load() & DEBUG_ULTRA_MINIMAL) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "diagnostic: DEBUG_ULTRA_MINIMAL — libc resolved "
+                      "(%d/11) but bytehook_init NOT called",
+                      libc_ok);
+        set_status(HOOK_STATUS_DEGRADED, buf);
+        LOGW("hook_manager_init: %s", buf);
+        return 0;
     }
 
     // Install SIGSEGV guard BEFORE bytehook_init so any early fault from a

@@ -57,6 +57,31 @@ object NetScope {
     const val DEBUG_SKIP_HOOKS: Int = 1 shl 1
 
     /**
+     * The most aggressive diagnostic: resolve libc via `dlsym(RTLD_NEXT)`
+     * and then **stop**. `bytehook_init()` is NEVER called — the
+     * shadowhook CFI-disable path, safe-init signal-handler installs,
+     * and bytehook's own mmap/mprotect calls are all skipped entirely.
+     *
+     * If the app still crashes with only this flag set, NetScope's
+     * runtime did nothing beyond pure dlsym on libc.so — the trigger
+     * must be something that merely *loading* libnetscope.so brings
+     * into the process (libbytehook.so DT_NEEDED, static initialisers,
+     * etc.). That would be an extremely unusual regression.
+     *
+     * If the app stops crashing with this flag, the trigger is somewhere
+     * inside `bytehook_init`, narrowing the search to that ~100 lines
+     * of third-party initialisation code.
+     *
+     * `HookReport.status = DEGRADED`, `failureReason = "diagnostic:
+     * DEBUG_ULTRA_MINIMAL — libc resolved (N/11) but bytehook_init NOT
+     * called"`. Traffic is NOT collected.
+     *
+     * Added 2026-04-23 per HONOR AGM3-W09HN triage, where
+     * DEBUG_SKIP_HOOKS still crashed with the same register fingerprint.
+     */
+    const val DEBUG_ULTRA_MINIMAL: Int = 1 shl 2
+
+    /**
      * Configure diagnostic flags. MUST be called BEFORE [init] — calls
      * after init have no effect. Pass [DEBUG_NONE] in production.
      *

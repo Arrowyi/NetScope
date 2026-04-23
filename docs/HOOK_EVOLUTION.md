@@ -214,10 +214,29 @@ Rather than guessing, two bit-flags in `NetScope.setDebugMode()` split the hypot
 
 | Flag | What it isolates |
 |---|---|
-| `DEBUG_TRACE_HOOKS` (1) | Every GOT write logs `{caller_lib, symbol, prev, new}`. Lines tagged `CONTESTED` identify libraries that were **already hooked** when bytehook got there — `prev != dlsym(RTLD_NEXT)`. Positive hit ⇒ host-app hooker conflict; mitigate via `bytehook_add_ignore("<lib>.so")` or coordinate load order. |
-| `DEBUG_SKIP_HOOKS` (2)  | `bytehook_init` runs (CFI disable, shadowhook trampoline registration, the whole load path) but NetScope registers zero stubs. If the app STILL crashes, the trigger is the bytehook load/init path itself — fix lives one layer down (disable CFI-disable, ship without shadowhook, or fall back to a raw PLT patcher). |
+| `DEBUG_TRACE_HOOKS` (1) | Every GOT write logs `{caller_lib, symbol, prev, new}`. Lines tagged `CONTESTED` identify libraries that were **already hooked** when bytehook got there — `prev != dlsym(RTLD_NEXT)`. Positive hit ⇒ host-app hooker conflict; mitigate via `bytehook_add_ignore("<lib>.so")` or coordinate load order. Additionally snapshots `/proc/self/maps` + 32 bytes at `libdl.so!__cfi_slowpath`, `libdl.so!dlopen`, `libc.so!abort/raise/malloc/free/connect/send/pthread_create` etc. before and after `bytehook_init`; any VMA or byte-level diff is logged as `init-diff: ...`. |
+| `DEBUG_SKIP_HOOKS` (2)  | `bytehook_init` runs (CFI disable, shadowhook trampoline registration, the whole load path) but NetScope registers zero stubs. If the app STILL crashes, the trigger is the bytehook load/init path itself, not NetScope's GOT writes. |
+| `DEBUG_ULTRA_MINIMAL` (4) | `bytehook_init` is **not called at all**. NetScope's runtime does nothing beyond `dlsym(RTLD_NEXT)` on ~11 libc symbols. Added 2026-04-23 after HONOR AGM3-W09HN triage proved `DEBUG_SKIP_HOOKS` still crashes with a bit-identical register fingerprint — i.e. the trigger lives inside `bytehook_init` itself, not in our stub writes. |
 
 These flags must be set **before** `NetScope.init()`. See README §"Diagnostic mode" for the HMI recipe.
+
+### 2026-04-23 — HONOR AGM3-W09HN verdict
+
+After `DEBUG_SKIP_HOOKS` and `DEBUG_ULTRA_MINIMAL` both ruled out "NetScope's GOT writes are the trigger", HMI's triage matrix (same APK, toggle only) looked like this:
+
+| # | Config | libnetscope loaded | JNI_OnLoad | nativeInit | bytehook_init | hook_all | Result |
+|---|---|---|---|---|---|---|---|
+| 0 | netmonitor out of APK | — | — | — | — | — | stable |
+| 1 | kill-switch | ✘ | ✘ | ✘ | ✘ | ✘ | stable 180 s |
+| 2 | baseline (clean reinstall) | ✔ | ✔ | ✘ | ✘ | ✘ | stable 180 s |
+| 3 | `DEBUG_SKIP_HOOKS` | ✔ | ✔ | ✔ | ✔ | ✘ | crash @ +20 s |
+| 4 | `DEBUG_TRACE+SKIP` | ✔ | ✔ | ✔ | ✔ | ✘ | crash @ +9 s |
+| 5 | `DEBUG_TRACE_HOOKS` | ✔ | ✔ | ✔ | ✔ | ✔ | crash @ +25 s |
+| 6 | normal | ✔ | ✔ | ✔ | ✔ | ✔ | crash @ +24 s |
+
+All 6 crashes have bit-identical register fingerprints (`x17` same, `x16/lr` same 12-bit offsets into libart.so, `pc == x8 ∈ [anon:libc_malloc]`) ⇒ deterministic bad dispatch through one specific ART JNI PLT site, not random heap corruption. The row that mattered was #3: `DEBUG_SKIP_HOOKS` still crashes even though bytehook wrote zero stubs, which falsifies every "we wrote a bad pointer" hypothesis and confirms the trigger is inside `bytehook_init` itself (probably shadowhook patching an ART/libc code sequence that the AOSP pattern doesn't match on EMUI 11 / Magic UI 4.0 / MTK Helio P65).
+
+The next lever under investigation is a bytehook backend that skips `shadowhook_init` entirely — see "If bytehook 1.1.1 fails" below.
 
 ## If bytehook 1.1.1 fails
 
