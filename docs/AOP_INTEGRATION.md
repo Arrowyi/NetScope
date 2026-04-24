@@ -96,14 +96,15 @@ a baseline snapshot captured at `init()`. Covers Java, Kotlin, C++,
 NDK, native libraries, raw sockets — whatever the kernel attributes to
 your UID. This is the "ground truth" number.
 
-**Layer B — Per-domain breakdown**: `getDomainStats()` /
+**Layer B — Per-API breakdown (v3.0.0+)**: `getApiStats()` /
 `getIntervalStats()` come from the AOP-instrumented Java call sites.
-Java-only, per-host.
+Each entry is one `(host, path)` tuple — see §2.5 for the exact key
+shape.
 
 By construction the Layer-B sum is always ≤ the Layer-A total:
 
 ```
-sum(getDomainStats().tx) <= getTotalStats().txTotal
+sum(getApiStats().tx) <= getTotalStats().txTotal
 ```
 
 The gap is non-instrumented traffic. If your app has a native HTTP
@@ -112,18 +113,38 @@ surface the gap in your UI:
 
 ```kotlin
 val total      = NetScope.getTotalStats()
-val attributed = NetScope.getDomainStats().sumOf { it.txBytesTotal + it.rxBytesTotal }
+val attributed = NetScope.getApiStats().sumOf { it.txBytesTotal + it.rxBytesTotal }
 val native     = (total.txTotal + total.rxTotal) - attributed
 ```
 
+### 2.5 API key shape (v3.0.0+)
+
+`ApiStats.key` is the concatenation `"$host$path"`, e.g.
+`api.example.com/v1/users/:id`. The two fields are produced by:
+
+| Field | Producer | Behaviour |
+|---|---|---|
+| `host` | `EndpointFormatter.format(host, port, defaultPort)` | Drops the scheme-default port (HTTPS `:443`, HTTP `:80`, WS `:80`, WSS `:443`). Keeps any non-default port verbatim. Raw IPs pass through. Emits `<unknown>` (or `<unknown>:port`) when the URL has no host. |
+| `path` | `PathNormalizer.normalize(rawPath)` | Numeric segments → `:id`. UUIDs → `:uuid`. Long hex (≥16 chars, mixed hex-with-letter) → `:hash`. Strips `?query` / `#fragment`, collapses `//`, drops trailing `/`, always starts with `/`. `GET` and `POST` against the same path merge. |
+
+Examples:
+
+| Inputs | `host` | `path` | `key` |
+|---|---|---|---|
+| `https://api.example.com/v1/users/123?page=2` | `api.example.com` | `/v1/users/:id` | `api.example.com/v1/users/:id` |
+| `https://api.example.com:8443/admin` | `api.example.com:8443` | `/admin` | `api.example.com:8443/admin` |
+| `http://192.168.1.5:9000/telemetry` | `192.168.1.5:9000` | `/telemetry` | `192.168.1.5:9000/telemetry` |
+| `wss://ws.example.com/ride/abcd1234567890abc` | `ws.example.com` | `/ride/:hash` | `ws.example.com/ride/:hash` |
+| (URL with null host) | `<unknown>` | `/` | `<unknown>/` |
+
 Effects of `init()` / `clearStats()` / `destroy()` on each layer:
 
-| Call | Layer A (kernel total) | Layer B (per-domain) |
+| Call | Layer A (kernel total) | Layer B (per-API, v3.0.0+) |
 |---|---|---|
-| `init()` (first) | Captures baseline → getTotalStats starts at 0 | Clears counters |
+| `init()` (first) | Captures baseline → getTotalStats starts at 0 | Clears per-API counters |
 | `init()` (subsequent, already active) | No-op | No-op |
-| `clearStats()` | Re-captures baseline → restarts at 0 | Clears counters |
-| `destroy()` | Resets `initialized=false`; subsequent `init()` re-baselines | (Counters remain; instrumentation stays) |
+| `clearStats()` | Re-captures baseline → restarts at 0 | Clears per-API counters |
+| `destroy()` | Resets `initialized=false`; subsequent `init()` re-baselines | (Counters remain; instrumentation stays in the bytecode) |
 | `pause()` / `resume()` | No effect (kernel keeps counting) | Suspends / resumes increments |
 
 On pre-Q OEM kernels that return `TrafficStats.UNSUPPORTED` (-1),
@@ -145,7 +166,7 @@ blank.
 > prebuilt AARs rather than as source sub-projects. v2.0.3's main
 > scope therefore includes `EXTERNAL_LIBRARIES` — call sites inside
 > these vendor AARs ARE rewritten and their traffic IS attributed to
-> the right domain via `getDomainStats()`. See §3.1 below for the
+> the right API via `getApiStats()`. See §3.1 below for the
 > tiny build-side caveat this brings.
 
 **What is NOT instrumented** (by design):
@@ -222,10 +243,19 @@ nets / explicit documentation for Proguard-only setups.
 ## 5. Reading stats
 
 ```kotlin
-// Layer B — per domain, sorted by total bytes desc (Java HTTP/S only):
-NetScope.getDomainStats().forEach { s ->
-    Log.i("HMI", "${s.domain}  ↑${s.txBytesTotal}  ↓${s.rxBytesTotal}")
+// Layer B — per API (host + path), sorted by total bytes desc:
+NetScope.getApiStats().forEach { s ->
+    Log.i("HMI", "${s.key}  ↑${s.txBytesTotal}  ↓${s.rxBytesTotal}")
 }
+
+// If your UI still groups by host:
+NetScope.getApiStats()
+    .groupBy { it.host }
+    .forEach { (host, rows) ->
+        val tx = rows.sumOf { it.txBytesTotal }
+        val rx = rows.sumOf { it.rxBytesTotal }
+        Log.i("HMI", "$host ↑$tx ↓$rx")
+    }
 
 // Layer A — total traffic (includes Java + native + NDK):
 val total = NetScope.getTotalStats()
@@ -253,7 +283,7 @@ compute Layer-A minus the sum of Layer-B:
 
 ```kotlin
 val native = total.totalBytes -
-    NetScope.getDomainStats().sumOf { it.txBytesTotal + it.rxBytesTotal }
+    NetScope.getApiStats().sumOf { it.txBytesTotal + it.rxBytesTotal }
 ```
 
 ### Callbacks

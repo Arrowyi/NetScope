@@ -8,7 +8,7 @@ import indi.arrowyi.netscope.sdk.internal.TrafficAggregator
 /**
  * Entry point for NetScope traffic statistics.
  *
- * **Architecture (v2.0.2+):** two layers.
+ * **Architecture (v3.0.0+):** two layers.
  *
  *   Layer A — [getTotalStats]: kernel-level *total* UID traffic since
  *   [init], obtained via [android.net.TrafficStats]. Includes
@@ -16,13 +16,23 @@ import indi.arrowyi.netscope.sdk.internal.TrafficAggregator
  *   C++, NDK, signed native blobs, raw sockets — whether or not
  *   NetScope's AOP layer saw it.
  *
- *   Layer B — [getDomainStats] / [getIntervalStats]: per-domain
+ *   Layer B — [getApiStats] / [getIntervalStats]: per-API (host+path)
  *   application-layer counters populated by the Gradle plugin's ASM
  *   instrumentation of `OkHttpClient.Builder#build`,
  *   `HttpsURLConnection`, and `OkHttpClient#newWebSocket`. Java-layer
  *   only.
  *
- *   `sum(getDomainStats().tx) <= getTotalStats().txTotal` is intentional
+ * **Breaking change from v2.x → v3.0.0:** `DomainStats` is gone;
+ * `getDomainStats()` is gone. Use [ApiStats] / [getApiStats]. An API
+ * key is `"$host$path"` where:
+ *   - `host` = actual host, with `:port` folded in when it's
+ *     non-default for the scheme (HTTPS 443 and HTTP 80 stay elided).
+ *     Raw IPs like `192.168.1.5:9000` show up verbatim. Connections we
+ *     can't resolve show `<unknown>` (optionally `<unknown>:port`).
+ *   - `path` = URL path with numeric IDs → `:id`, UUIDs → `:uuid`,
+ *     long hex strings → `:hash`. Query/fragment stripped.
+ *
+ *   `sum(getApiStats().tx) <= getTotalStats().txTotal` is intentional
  *   — the gap is "non-instrumented traffic", mostly native. HMIs may
  *   surface this gap if useful.
  *
@@ -35,7 +45,7 @@ object NetScope {
     internal val aggregator = TrafficAggregator()
 
     @Volatile private var initialized: Boolean = false
-    @Volatile private var flowEndCallback: ((DomainStats) -> Unit)? = null
+    @Volatile private var flowEndCallback: ((ApiStats) -> Unit)? = null
 
     // Layer-A (kernel) baseline captured at init(). getTotalStats()
     // returns (currentReading - baseline) so numbers are "since init".
@@ -53,7 +63,7 @@ object NetScope {
      * Initialise NetScope. Idempotent.
      *
      * First successful call:
-     *   - clears per-domain AOP counters (Layer B),
+     *   - clears per-API AOP counters (Layer B),
      *   - captures a kernel-level tx/rx baseline (Layer A), so
      *     [getTotalStats] numbers are "since init" rather than
      *     "since device boot".
@@ -61,7 +71,7 @@ object NetScope {
      * Subsequent calls while already initialised are no-ops.
      */
     @Synchronized
-    fun init(context: Context): Status {
+    fun init(@Suppress("UNUSED_PARAMETER") context: Context): Status {
         if (initialized) return Status.ACTIVE
         aggregator.clear()
         val tx = reader.getUidTxBytes()
@@ -71,7 +81,7 @@ object NetScope {
         initialized = true
         Log.i(
             TAG,
-            "initialised (AOP runtime; domain counters reset; " +
+            "initialised (AOP runtime; API counters reset; " +
                 "baselineTx=$baselineTx rx=$baselineRx)"
         )
         return Status.ACTIVE
@@ -92,8 +102,8 @@ object NetScope {
     /**
      * Reset all collected stats.
      *
-     * Clears per-domain AOP counters (Layer B) AND re-captures the
-     * Layer-A kernel baseline, so both totals and per-domain numbers
+     * Clears per-API AOP counters (Layer B) AND re-captures the
+     * Layer-A kernel baseline, so both totals and per-API numbers
      * restart from zero.
      */
     @Synchronized
@@ -116,16 +126,16 @@ object NetScope {
 
     /**
      * Cumulative stats since [init] / last [clearStats], sorted by
-     * total bytes descending.
+     * total bytes descending. Each entry is one (host, path) tuple.
      */
-    fun getDomainStats(): List<DomainStats> =
-        aggregator.getDomainStats().sortedByDescending { it.totalBytes }
+    fun getApiStats(): List<ApiStats> =
+        aggregator.getApiStats().sortedByDescending { it.totalBytes }
 
     /**
      * Stats for the last completed interval (since last
      * [markIntervalBoundary]), sorted by interval bytes desc.
      */
-    fun getIntervalStats(): List<DomainStats> =
+    fun getIntervalStats(): List<ApiStats> =
         aggregator.getIntervalStats()
             .sortedByDescending { it.txBytesInterval + it.rxBytesInterval }
 
@@ -135,7 +145,7 @@ object NetScope {
      * Source: `android.net.TrafficStats.getUid{Tx,Rx}Bytes(myUid)`
      * minus the baseline captured at [init]. Covers all traffic the
      * kernel counts for our UID — Java, native, NDK, C++ — not just
-     * what NetScope's AOP instrumentation observed. `sum(getDomainStats())`
+     * what NetScope's AOP instrumentation observed. `sum(getApiStats())`
      * will be `<=` this number; the gap is non-instrumented traffic.
      *
      * `connCountTotal` remains a Java-layer count (OkHttp /
@@ -181,27 +191,34 @@ object NetScope {
 
     /**
      * Register a callback invoked whenever one logical flow terminates
-     * (HTTP response drained / closed connection). The [DomainStats]
+     * (HTTP response drained / closed connection). The [ApiStats]
      * passed in has `txBytesInterval` / `rxBytesInterval` reflecting
      * just that one flow.
      */
-    fun setOnFlowEnd(callback: ((DomainStats) -> Unit)?) {
+    fun setOnFlowEnd(callback: ((ApiStats) -> Unit)?) {
         flowEndCallback = callback
     }
 
-    /** Internal: accessed by integration wrappers when a flow closes. */
-    internal fun reportFlowEnd(domain: String, txIncrement: Long, rxIncrement: Long) {
-        aggregator.flowEnded(domain, txIncrement, rxIncrement, flowEndCallback)
+    // ─── Internal API used by the generated wrappers ─────────────────
+    //
+    // Callers are the classes under `integration/`, which already ran
+    // `EndpointFormatter.format(...)` and `PathNormalizer.normalize(...)`
+    // on their inputs. The aggregator stores these strings verbatim —
+    // it does not re-normalise — which keeps the hot path allocation-free.
+
+    /** Internal: flow terminated (response closed, URLConnection input drained, WS closed). */
+    internal fun reportFlowEnd(host: String, path: String, txIncrement: Long, rxIncrement: Long) {
+        aggregator.flowEnded(host, path, txIncrement, rxIncrement, flowEndCallback)
     }
 
-    /** Internal: add tx bytes for a domain. */
-    internal fun reportTx(domain: String, bytes: Long) {
-        aggregator.addTx(domain, bytes)
+    /** Internal: add tx bytes. */
+    internal fun reportTx(host: String, path: String, bytes: Long) {
+        aggregator.addTx(host, path, bytes)
     }
 
-    /** Internal: add rx bytes for a domain. */
-    internal fun reportRx(domain: String, bytes: Long) {
-        aggregator.addRx(domain, bytes)
+    /** Internal: add rx bytes. */
+    internal fun reportRx(host: String, path: String, bytes: Long) {
+        aggregator.addRx(host, path, bytes)
     }
 
     /**

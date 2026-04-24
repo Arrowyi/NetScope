@@ -10,9 +10,11 @@ A lightweight Android SDK that reports:
   via `android.net.TrafficStats`. Includes Java, Kotlin, C++, NDK,
   native libraries, raw sockets — anything the kernel counts for your
   app.
-- **Layer B — Per-domain Java-layer breakdown** via build-time AOP
-  instrumentation of `OkHttpClient.Builder.build()`,
-  `HttpsURLConnection`, and `OkHttpClient.newWebSocket(...)`.
+- **Layer B — Per-API (host + path) Java-layer breakdown** via
+  build-time AOP instrumentation of `OkHttpClient.Builder.build()`,
+  `HttpsURLConnection`, and `OkHttpClient.newWebSocket(...)`. v3.0.0+:
+  API granularity (`api.example.com/v1/users/:id`) replaces the old
+  domain-only granularity — see [Migrating from v2 → v3](#migrating-from-v2--v3).
 
 Zero source-code changes to the host app. Works on phones, tablets,
 and **Android Automotive** / OEM car head-units where `VpnService` /
@@ -30,9 +32,9 @@ your app module, every call to:
 - `OkHttpClient.newWebSocket(...)`
 
 is rewritten at compile time to route through lightweight NetScope
-wrappers that count bytes per-domain. For the *total* number,
-NetScope additionally reads kernel-level `TrafficStats` so native /
-non-instrumented traffic is not missing.
+wrappers that count bytes per-API (host + normalised path). For the
+*total* number, NetScope additionally reads kernel-level `TrafficStats`
+so native / non-instrumented traffic is not missing.
 
 ```
           Java HTTPS / OkHttp              HttpsURLConnection                 OkHttp WebSocket
@@ -45,9 +47,9 @@ non-instrumented traffic is not missing.
         │  OkHttpClient.newWebSocket()       → wrapped listener + wrapped WebSocket           │
         └────────────────────────────────────┬────────────────────────────────────────────────┘
                                              ▼
-               Layer B: TrafficAggregator (AtomicLong per-domain counters)
+        Layer B: TrafficAggregator (AtomicLong counters, key = host + path)
                                              ▼
-                                getDomainStats / getIntervalStats
+                                getApiStats / getIntervalStats
 
           Kernel (xt_qtaguid / eBPF)  ──►  TrafficStats.getUid{Tx,Rx}Bytes
                                              ▼
@@ -59,23 +61,45 @@ non-instrumented traffic is not missing.
 ### Layer A vs Layer B — what each number means
 
 `getTotalStats()` is "since `init()`, kernel-level, all sources".
-`getDomainStats()` is "since `init()`, AOP-observed Java HTTP/S, per
-host". The **gap** between them is non-instrumented traffic — native
-HTTP clients, NDK / C++ code, libcurl, raw `java.net.Socket`, signed
-binary blobs. By construction:
+`getApiStats()` is "since `init()`, AOP-observed Java HTTP/S, one
+entry per (host, path)". The **gap** between them is non-instrumented
+traffic — native HTTP clients, NDK / C++ code, libcurl, raw
+`java.net.Socket`, signed binary blobs. By construction:
 
 ```
-sum(getDomainStats().tx) <= getTotalStats().txTotal
+sum(getApiStats().tx) <= getTotalStats().txTotal
 ```
 
 HMIs that want to surface attribution can render the difference
 explicitly:
 
 ```kotlin
-val total    = NetScope.getTotalStats()
-val attributed = NetScope.getDomainStats().sumOf { it.txBytesTotal + it.rxBytesTotal }
-val native   = total.totalBytes - attributed   // native / non-instrumented
+val total      = NetScope.getTotalStats()
+val attributed = NetScope.getApiStats().sumOf { it.txBytesTotal + it.rxBytesTotal }
+val native     = total.totalBytes - attributed   // native / non-instrumented
 ```
+
+### API key shape (v3.0.0+)
+
+Each `ApiStats` has two string fields and a derived `key = "$host$path"`:
+
+| Field | Example |
+|---|---|
+| `host` | `api.example.com` (default-port scheme) |
+|   | `api.example.com:8080` (non-default port surfaces automatically) |
+|   | `192.168.1.5:9000` (raw IP + port for mystery internal services) |
+|   | `<unknown>` or `<unknown>:9000` (unresolvable host; port preserved when known) |
+| `path` | `/v1/users` (verbatim) |
+|   | `/v1/users/:id` (numeric IDs templated) |
+|   | `/accounts/:uuid/avatar` (UUIDs templated) |
+|   | `/file/:hash` (long hex strings templated) |
+|   | Query strings (`?q=...`) and fragments (`#...`) are stripped; trailing slashes dropped; `GET` and `POST` against the same path merge. |
+
+Port handling drops the scheme default (HTTPS `:443` / HTTP `:80`) so
+ordinary traffic stays clean, but a non-default port always shows up —
+the same `api.example.com` on two different ports splits into two API
+entries, which matches what the kernel / network actually treats them
+as.
 
 ### Why this architecture
 
@@ -126,7 +150,7 @@ buildscript {
         // groupId is `com.github.Arrowyi.NetScope` (DOT, not colon) —
         // JitPack multi-module convention because both artifacts come
         // from the same repo.
-        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.3'
+        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v3.0.0'
     }
 }
 ```
@@ -142,11 +166,12 @@ apply plugin: 'kotlin-android'
 apply plugin: 'indi.arrowyi.netscope'
 
 dependencies {
-    implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.3'
+    implementation 'com.github.Arrowyi.NetScope:NetScope:v3.0.0'
 }
 ```
 
-The `v2.0.3` tag is pinned. For other releases, pick a tag from
+The `v3.0.0` tag is pinned. **v3.0.0 is a breaking change** — see
+[Migrating from v2 → v3](#migrating-from-v2--v3). For other releases, pick a tag from
 [Releases](https://github.com/Arrowyi/NetScope/releases) or an exact
 short SHA from
 [github.com/Arrowyi/NetScope/commits/main](https://github.com/Arrowyi/NetScope/commits/main).
@@ -162,7 +187,7 @@ class MyApplication : Application() {
         NetScope.init(this)                 // always returns ACTIVE
         NetScope.setLogInterval(30)         // optional periodic report
         NetScope.setOnFlowEnd { stats ->    // optional per-flow callback
-            Log.d("NetScope", "${stats.domain} ↑${stats.txBytesInterval} ↓${stats.rxBytesInterval}")
+            Log.d("NetScope", "${stats.key} ↑${stats.txBytesInterval} ↓${stats.rxBytesInterval}")
         }
     }
 }
@@ -182,18 +207,20 @@ connections, and WebSockets are instrumented at build time.
 | `pause()` / `resume()` | Suspend / resume **per-domain** counting. Affects Layer B only — `getTotalStats()` (Layer A / kernel) keeps counting. |
 | `clearStats()` | Reset per-domain counters AND re-capture kernel baseline, so both layers restart from 0. |
 | `markIntervalBoundary()` | Freeze current-interval counters into the interval snapshot; start a new interval. |
-| `getDomainStats(): List<DomainStats>` | **Layer B.** AOP per-domain cumulative since `init()` / last `clearStats()`. Java-only. Sorted by total bytes desc. |
-| `getIntervalStats(): List<DomainStats>` | Last completed interval's per-domain stats. |
+| `getApiStats(): List<ApiStats>` | **Layer B.** AOP per-API (host + path) cumulative since `init()` / last `clearStats()`. Java-only. Sorted by total bytes desc. |
+| `getIntervalStats(): List<ApiStats>` | Last completed interval's per-API stats. |
 | `getTotalStats(): TotalStats` | **Layer A.** Kernel-level UID traffic (Java + native + NDK) since `init()`. Source: `TrafficStats.getUid{Tx,Rx}Bytes`. |
 | `setLogInterval(seconds: Int)` | Start / stop periodic `adb logcat` reports (tag `NetScope`). Pass `0` to stop. |
 | `setOnFlowEnd(cb?)` | Register per-flow-close callback. Pass `null` to clear. |
 | `destroy()` | Stop the reporter and clear state. Instrumentation stays in the bytecode; rebuild without the plugin to fully remove. |
 
-### `DomainStats` (data class)
+### `ApiStats` (data class, v3.0.0+)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `domain` | `String` | Target host |
+| `host` | `String` | Target host. May include `:port` when non-default for the scheme (`api.example.com:8080`, `192.168.1.5:9000`). Unresolvable hosts surface as `<unknown>` (or `<unknown>:port` when port is known). |
+| `path` | `String` | Normalised URL path. Always starts with `/`; numeric IDs → `:id`, UUIDs → `:uuid`, long hex strings → `:hash`. Query and fragment stripped. |
+| `key` | `String` | Derived: `"$host$path"`, e.g. `api.example.com/v1/users/:id`. Stable identifier. |
 | `txBytesTotal` / `rxBytesTotal` | `Long` | Cumulative bytes |
 | `txBytesInterval` / `rxBytesInterval` | `Long` | Bytes in current / last interval window |
 | `connCountTotal` / `connCountInterval` | `Int` | Closed-flow counts |
@@ -213,11 +240,13 @@ connections, and WebSockets are instrumented at build time.
 ```
 I NetScope: ══════ Traffic Report [2026-04-24 12:00:00] ══════
 I NetScope: ── Interval ──────────────────────────────
-I NetScope:   api.github.com                           ↑1.2 KB    ↓45.6 KB   conn=3
-I NetScope:   www.google.com                           ↑0.8 KB    ↓12.1 KB   conn=1
+I NetScope:   api.github.com/repos/:id/issues                              ↑1.2 KB    ↓45.6 KB   conn=3
+I NetScope:   www.google.com/complete/search                               ↑0.8 KB    ↓12.1 KB   conn=1
+I NetScope:   192.168.1.5:9000/telemetry                                   ↑0.1 KB    ↓0.3 KB    conn=1
 I NetScope: ── Cumulative ────────────────────────────
-I NetScope:   api.github.com                           ↑8.4 KB    ↓312.0 KB  conn=21
-I NetScope:   www.google.com                           ↑3.2 KB    ↓88.7 KB   conn=7
+I NetScope:   api.github.com/repos/:id/issues                              ↑8.4 KB    ↓312.0 KB  conn=21
+I NetScope:   api.github.com/user/:id                                      ↑1.1 KB    ↓4.2 KB    conn=3
+I NetScope:   www.google.com/complete/search                               ↑3.2 KB    ↓88.7 KB   conn=7
 I NetScope: ── Total (kernel UID, since init) ────────
 I NetScope:   ↑18.3 KB  ↓512.0 KB  conn=28
 I NetScope:   non-instrumented (native/NDK): 118.2 KB
@@ -240,17 +269,23 @@ are skipped. **Apply this plugin after AspectJ in your plugin order.**
 ## Known Limitations
 
 - **Raw `OkHttpClient()` no-arg constructor** bypasses the Builder path
-  and is therefore not visible in `getDomainStats()`. Its traffic IS
-  still counted in `getTotalStats()` (kernel-level). Prefer
-  `OkHttpClient.Builder().build()` if you want the per-domain breakdown.
+  and is therefore not visible in `getApiStats()`. Its traffic IS still
+  counted in `getTotalStats()` (kernel-level). Prefer
+  `OkHttpClient.Builder().build()` if you want the per-API breakdown.
 - **Reflection-constructed HTTP clients** are not instrumented — per-
-  domain stats will miss them. Again, `getTotalStats()` still includes
+  API stats will miss them. Again, `getTotalStats()` still includes
   their traffic.
 - **Native HTTP clients** (NDK code, WebView / Chromium, libcurl via
-  JNI) show up in `getTotalStats()` but not `getDomainStats()`. Compute
-  `total - sum(domains)` to surface this gap.
-- **`java.net.Socket` direct use** is not per-domain-instrumented but
-  is counted in the kernel total.
+  JNI) show up in `getTotalStats()` but not `getApiStats()`. Compute
+  `total - sum(apis)` to surface this gap.
+- **`java.net.Socket` direct use** is not per-API-instrumented but is
+  counted in the kernel total.
+- **Path templating is heuristic.** `:id`/`:uuid`/`:hash` are applied
+  per segment based on regex, so `/articles/some-natural-slug` stays
+  literal (desired) but a numeric slug like `/articles/2026` collapses
+  to `/articles/:id` (may be too aggressive for editorial APIs). The
+  v3.0.0 rules are intentionally conservative; a pluggable normalizer
+  is on the roadmap if host apps need custom rules.
 - **`pause()`** suspends Layer B (per-domain) counting but does NOT
   suspend Layer A (kernel total). The kernel keeps counting regardless
   of SDK state.
@@ -265,7 +300,73 @@ are skipped. **Apply this plugin after AspectJ in your plugin order.**
   fresh global seen-set each run, so the Transform opts out of
   incremental builds. Full rebuilds cost a few seconds more; the
   per-class bytecode prefilter from v2.0.2 keeps this minimal.
-  Vendor-AAR call sites ARE covered by `getDomainStats()`.
+  Vendor-AAR call sites ARE covered by `getApiStats()`.
+
+## Migrating from v2 → v3
+
+v3.0.0 is a **breaking release**. One new concept (API granularity),
+four renamed symbols, no behaviour change for `getTotalStats()`.
+
+### At a glance
+
+| v2.x | v3.0.0 | Notes |
+|---|---|---|
+| `DomainStats` | `ApiStats` | New fields: `host`, `path`, `key`. `domain` removed. |
+| `NetScope.getDomainStats()` | `NetScope.getApiStats()` | Returns `List<ApiStats>`. |
+| `NetScope.getIntervalStats()` returning `DomainStats` | Same name, now returns `List<ApiStats>` | Signature change only. |
+| `NetScope.setOnFlowEnd((DomainStats) -> Unit)` | `NetScope.setOnFlowEnd((ApiStats) -> Unit)` | |
+| `stats.domain` | `stats.host` + `stats.path` or `stats.key` | Depending on whether you want the raw host or a pretty `host/path` string. |
+
+### Code migration — before / after
+
+Before (v2.x):
+
+```kotlin
+NetScope.setOnFlowEnd { s ->
+    Log.d("Net", "${s.domain} ↑${s.txBytesInterval} ↓${s.rxBytesInterval}")
+}
+NetScope.getDomainStats().forEach { render(it.domain, it.totalBytes) }
+```
+
+After (v3.0.0):
+
+```kotlin
+NetScope.setOnFlowEnd { s ->
+    Log.d("Net", "${s.key} ↑${s.txBytesInterval} ↓${s.rxBytesInterval}")
+}
+NetScope.getApiStats().forEach { render(it.key, it.totalBytes) }
+
+// If your HMI's existing UI still groups by host, fold on `host`:
+NetScope.getApiStats()
+    .groupBy { it.host }
+    .mapValues { (_, rows) -> rows.sumOf { it.totalBytes } }
+```
+
+### Why we broke the API
+
+Host-level aggregation (`api.example.com` = one row) is too coarse
+for HMIs that care which endpoint is expensive. v3.0.0 splits every
+`(host, path)` into its own row so an auto-telematics app can tell
+`/v1/location` (chatty, small payloads) apart from `/v1/map-tiles`
+(infrequent, big payloads) even when they share `api.example.com`.
+
+Adding a parallel `getApiStats()` alongside the old `getDomainStats()`
+would have doubled the aggregator's memory footprint. For an SDK that
+must run on constrained OEM head-units, that was not worth the
+source-compat savings.
+
+### Upgrade checklist
+
+- [ ] Replace every `DomainStats` reference with `ApiStats`.
+- [ ] Replace every `getDomainStats()` call with `getApiStats()`.
+- [ ] Replace every `stats.domain` access with `stats.key` (or
+      `stats.host` + `stats.path` if you want to render them separately).
+- [ ] If your UI grouped rows by host, add `.groupBy { it.host }` at
+      the presentation layer.
+- [ ] Rebuild — the Gradle plugin `v3.0.0` is required to emit
+      bytecode matching the new 3-arg `wrapListener` / `wrapWebSocket`
+      helpers. Mixing v2.x plugin with v3.x SDK (or vice versa) will
+      fail at link time with `NoSuchMethodError`.
 
 ## Contributors / maintainers
 

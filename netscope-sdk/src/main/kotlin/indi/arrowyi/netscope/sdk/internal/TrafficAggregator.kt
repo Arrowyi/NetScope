@@ -1,31 +1,37 @@
 package indi.arrowyi.netscope.sdk.internal
 
-import indi.arrowyi.netscope.sdk.DomainStats
+import indi.arrowyi.netscope.sdk.ApiStats
 import indi.arrowyi.netscope.sdk.TotalStats
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * In-process per-domain traffic counters.
+ * In-process per-API traffic counters (v3.0.0+).
  *
- * Concurrency model:
- *  - Every domain has its own [DomainCounter] holding AtomicLong counters
- *    for tx/rx (cumulative and current-interval) and an AtomicInteger for
- *    closed-flow count. All increments are lock-free.
- *  - The domain map is a [ConcurrentHashMap]; `computeIfAbsent` is used
- *    to install new counters atomically.
+ * The aggregator keys on the tuple `(host, path)`:
+ *   - `host` is the already-formatted endpoint string produced by
+ *     [EndpointFormatter] (may include `:port`, may be
+ *     `<unknown>` / `<unknown>:port` for unresolvable connections).
+ *   - `path` is a normalised URL path produced by [PathNormalizer]
+ *     (templated IDs / UUIDs / hashes, always starts with `/`).
+ *
+ * Concurrency:
+ *  - Every API key has its own [ApiCounter] holding AtomicLong counters
+ *    for tx/rx (cumulative and current-interval) and an AtomicInteger
+ *    for closed-flow count. All increments are lock-free.
+ *  - The map is a [ConcurrentHashMap]; `computeIfAbsent` installs new
+ *    counters atomically.
  *  - Interval boundaries are taken under [snapshotLock] to make
- *    "snapshot the interval and reset interval counters" one atomic step
- *    relative to readers of [getIntervalStats]. Writers (addTx/addRx) do
- *    NOT take this lock — they atomically add to both cumulative and
- *    interval counters; a boundary that races with an addTx may attribute
- *    the bytes to the new interval. Over long time scales this is a
- *    rounding error, not a correctness issue.
+ *    "snapshot then reset" one atomic step relative to readers of
+ *    [getIntervalStats]. Writers (addTx/addRx) do NOT take this lock —
+ *    they atomically add to both cumulative and interval counters; a
+ *    boundary racing with an addTx may attribute the bytes to the new
+ *    interval. Over long time scales this is a rounding error.
  */
 internal class TrafficAggregator {
 
-    private class DomainCounter(val domain: String) {
+    private class ApiCounter(val host: String, val path: String) {
         val txTotal = AtomicLong(0L)
         val rxTotal = AtomicLong(0L)
         val txInterval = AtomicLong(0L)
@@ -34,78 +40,82 @@ internal class TrafficAggregator {
         val connClosedInterval = AtomicInteger(0)
         @Volatile var lastActiveMs: Long = System.currentTimeMillis()
 
-        // last-snapshot values — what the most recent markIntervalBoundary
-        // froze, returned by getIntervalStats(). We keep them frozen so
-        // repeated reads between boundaries are stable and cheap.
         @Volatile var txIntervalSnap: Long = 0L
         @Volatile var rxIntervalSnap: Long = 0L
         @Volatile var connIntervalSnap: Int = 0
     }
 
-    private val domains = ConcurrentHashMap<String, DomainCounter>()
+    private val apis = ConcurrentHashMap<String, ApiCounter>()
     private val snapshotLock = Any()
 
     @Volatile private var paused: Boolean = false
 
     fun setPaused(p: Boolean) { paused = p }
 
-    private fun counterFor(domain: String): DomainCounter =
-        domains.computeIfAbsent(domain) { DomainCounter(it) }
+    /** Build the internal map key. NUL is used as a separator because
+     * neither a formatted host nor a URL path can legally contain it. */
+    private fun makeKey(host: String, path: String): String = "$host\u0000$path"
+
+    private fun counterFor(host: String, path: String): ApiCounter =
+        apis.computeIfAbsent(makeKey(host, path)) { ApiCounter(host, path) }
 
     /**
-     * Called by the integration wrappers (interceptor / URL connection /
-     * WebSocket) as soon as bytes are observed. [flowEndCallback], set
-     * via [setOnFlowEnd], does NOT fire from here — it fires on
-     * [flowEnded].
+     * Add `bytes` of TX (bytes sent to remote) to the counter for the
+     * given API endpoint. No-op when paused or when `bytes <= 0`.
      */
-    fun addTx(domain: String, bytes: Long) {
+    fun addTx(host: String, path: String, bytes: Long) {
         if (paused || bytes <= 0) return
-        val c = counterFor(domain)
+        val c = counterFor(host, path)
         c.txTotal.addAndGet(bytes)
         c.txInterval.addAndGet(bytes)
         c.lastActiveMs = System.currentTimeMillis()
     }
 
-    fun addRx(domain: String, bytes: Long) {
+    /** Symmetric to [addTx] for RX bytes. */
+    fun addRx(host: String, path: String, bytes: Long) {
         if (paused || bytes <= 0) return
-        val c = counterFor(domain)
+        val c = counterFor(host, path)
         c.rxTotal.addAndGet(bytes)
         c.rxInterval.addAndGet(bytes)
         c.lastActiveMs = System.currentTimeMillis()
     }
 
     /**
-     * Invoked by integration wrappers when one logical flow
-     * (HTTP request/response cycle, a closed WebSocket, a closed
-     * HttpsURLConnection stream pair, ...) terminates.
+     * Invoked by integration wrappers when one logical flow terminates
+     * (an HTTP response drained, a WebSocket closed, a URLConnection
+     * stream pair exhausted).
      *
-     * @param domain            host the flow targeted
-     * @param txIncrement       bytes tx'd by this flow (can be 0; many
-     *                          callers already called addTx incrementally)
-     * @param rxIncrement       bytes rx'd by this flow
-     * @param flowEndCallback   user-supplied callback, invoked with a
-     *                          DomainStats whose *Interval fields reflect
-     *                          only THIS flow. Safe to pass null.
+     * @param host              already-formatted endpoint (host[:port]).
+     * @param path              normalised URL path.
+     * @param txIncrement       bytes tx'd by this flow (can be 0 when the
+     *                          caller already reported bytes incrementally).
+     * @param rxIncrement       bytes rx'd by this flow.
+     * @param flowEndCallback   user callback; receives an [ApiStats] whose
+     *                          *Interval fields reflect only THIS flow,
+     *                          *Total fields the cumulative current state.
+     *                          Safe to pass null. Thrown exceptions are
+     *                          swallowed — a buggy host callback MUST NOT
+     *                          kill the calling thread (OkHttp dispatcher,
+     *                          HTTP transport, ...).
      */
     fun flowEnded(
-        domain: String,
+        host: String,
+        path: String,
         txIncrement: Long,
         rxIncrement: Long,
-        flowEndCallback: ((DomainStats) -> Unit)?
+        flowEndCallback: ((ApiStats) -> Unit)?
     ) {
         if (paused) return
-        if (txIncrement > 0) addTx(domain, txIncrement)
-        if (rxIncrement > 0) addRx(domain, rxIncrement)
-        val c = counterFor(domain)
+        if (txIncrement > 0) addTx(host, path, txIncrement)
+        if (rxIncrement > 0) addRx(host, path, rxIncrement)
+        val c = counterFor(host, path)
         c.connClosedTotal.incrementAndGet()
         c.connClosedInterval.incrementAndGet()
         c.lastActiveMs = System.currentTimeMillis()
         if (flowEndCallback != null) {
-            // Construct a per-flow DomainStats — Interval fields hold
-            // exactly the flow's own bytes, Total fields reflect the
-            // current cumulative state.
-            val snapshot = DomainStats(
-                domain = domain,
+            val snapshot = ApiStats(
+                host = host,
+                path = path,
                 txBytesTotal = c.txTotal.get(),
                 rxBytesTotal = c.rxTotal.get(),
                 txBytesInterval = txIncrement.coerceAtLeast(0),
@@ -117,15 +127,14 @@ internal class TrafficAggregator {
             try {
                 flowEndCallback.invoke(snapshot)
             } catch (_: Throwable) {
-                // A buggy host callback MUST NOT kill the calling thread
-                // (HTTP transport, OkHttp dispatcher, ...). Swallow silently.
+                // Swallow — see KDoc.
             }
         }
     }
 
     fun markIntervalBoundary() {
         synchronized(snapshotLock) {
-            for (c in domains.values) {
+            for (c in apis.values) {
                 c.txIntervalSnap = c.txInterval.getAndSet(0L)
                 c.rxIntervalSnap = c.rxInterval.getAndSet(0L)
                 c.connIntervalSnap = c.connClosedInterval.getAndSet(0)
@@ -135,17 +144,18 @@ internal class TrafficAggregator {
 
     fun clear() {
         synchronized(snapshotLock) {
-            domains.clear()
+            apis.clear()
         }
     }
 
-    fun getDomainStats(): List<DomainStats> {
-        return domains.values.map { c ->
-            DomainStats(
-                domain = c.domain,
+    /** Cumulative view — interval fields hold the *live* (unfrozen) current-window bytes. */
+    fun getApiStats(): List<ApiStats> {
+        return apis.values.map { c ->
+            ApiStats(
+                host = c.host,
+                path = c.path,
                 txBytesTotal = c.txTotal.get(),
                 rxBytesTotal = c.rxTotal.get(),
-                // "current" interval fields for cumulative API = live values
                 txBytesInterval = c.txInterval.get(),
                 rxBytesInterval = c.rxInterval.get(),
                 connCountTotal = c.connClosedTotal.get(),
@@ -155,11 +165,12 @@ internal class TrafficAggregator {
         }
     }
 
-    fun getIntervalStats(): List<DomainStats> {
-        // Return the frozen snapshot from the last markIntervalBoundary.
-        return domains.values.map { c ->
-            DomainStats(
-                domain = c.domain,
+    /** Frozen snapshot from the last [markIntervalBoundary]. */
+    fun getIntervalStats(): List<ApiStats> {
+        return apis.values.map { c ->
+            ApiStats(
+                host = c.host,
+                path = c.path,
                 txBytesTotal = c.txTotal.get(),
                 rxBytesTotal = c.rxTotal.get(),
                 txBytesInterval = c.txIntervalSnap,
@@ -173,7 +184,7 @@ internal class TrafficAggregator {
 
     fun getTotalStats(): TotalStats {
         var tx = 0L; var rx = 0L; var cn = 0
-        for (c in domains.values) {
+        for (c in apis.values) {
             tx += c.txTotal.get()
             rx += c.rxTotal.get()
             cn += c.connClosedTotal.get()

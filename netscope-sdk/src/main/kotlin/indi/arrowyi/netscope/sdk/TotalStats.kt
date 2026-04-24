@@ -10,9 +10,9 @@ package indi.arrowyi.netscope.sdk
  * NDK, signed native blobs, raw sockets — whether or not NetScope's
  * ASM instrumentation saw it. This is the "Layer A" number.
  *
- * By contrast [DomainStats] (from [NetScope.getDomainStats]) is
+ * By contrast [ApiStats] (from [NetScope.getApiStats]) is
  * "Layer B" — only what the AOP-instrumented Java paths saw. The
- * invariant `sum(DomainStats.totalBytes) <= TotalStats.totalBytes` is
+ * invariant `sum(ApiStats.totalBytes) <= TotalStats.totalBytes` is
  * intentional; the delta is non-instrumented (usually native)
  * traffic.
  *

@@ -83,15 +83,15 @@ class NetScopeTotalStatsTest {
     @Test
     fun `UNSUPPORTED reader falls back to AOP aggregator sum`() {
         // Seed the AOP aggregator so the fallback path has something.
-        NetScope.reportTx("api.example.com", 123)
-        NetScope.reportRx("api.example.com", 456)
+        NetScope.reportTx("api.example.com", "/v1/ping", 123)
+        NetScope.reportRx("api.example.com", "/v1/ping", 456)
 
         reader.tx = SystemTrafficReader.UNSUPPORTED
         reader.rx = SystemTrafficReader.UNSUPPORTED
         NetScope.init(context)
         // init() clears the aggregator on first call, so re-seed after.
-        NetScope.reportTx("api.example.com", 111)
-        NetScope.reportRx("api.example.com", 222)
+        NetScope.reportTx("api.example.com", "/v1/ping", 111)
+        NetScope.reportRx("api.example.com", "/v1/ping", 222)
 
         val out = NetScope.getTotalStats()
         assertEquals("UNSUPPORTED must fall back to AOP sum", 111L, out.txTotal)
@@ -119,15 +119,15 @@ class NetScopeTotalStatsTest {
     }
 
     @Test
-    fun `init resets per-domain aggregator too`() {
-        NetScope.reportTx("a.com", 1_000)
-        NetScope.reportRx("b.com", 2_000)
-        assertTrue(NetScope.getDomainStats().isNotEmpty())
+    fun `init resets per-api aggregator too`() {
+        NetScope.reportTx("a.com", "/x", 1_000)
+        NetScope.reportRx("b.com", "/y", 2_000)
+        assertTrue(NetScope.getApiStats().isNotEmpty())
 
         NetScope.init(context)
         assertTrue(
-            "init() must clear Layer-B per-domain counters",
-            NetScope.getDomainStats().isEmpty()
+            "init() must clear Layer-B per-api counters",
+            NetScope.getApiStats().isEmpty()
         )
     }
 
@@ -196,8 +196,8 @@ class NetScopeTotalStatsTest {
         reader.rx = 0
         NetScope.init(context)
 
-        NetScope.aggregator.flowEnded("x.com", 1, 2, null)
-        NetScope.aggregator.flowEnded("y.com", 3, 4, null)
+        NetScope.aggregator.flowEnded("x.com", "/a", 1, 2, null)
+        NetScope.aggregator.flowEnded("y.com", "/b", 3, 4, null)
 
         val out = NetScope.getTotalStats()
         assertEquals(

@@ -30,7 +30,7 @@ import java.util.jar.JarOutputStream
  * **Scope choice (v2.0.3+):** main scope is `{PROJECT, SUB_PROJECTS,
  * EXTERNAL_LIBRARIES}`, so OkHttp / URL / WebSocket call sites inside
  * vendor AARs (e.g. an HMI's `:search` module shipped as a prebuilt
- * AAR) are also rewritten and contribute to `getDomainStats()`.
+ * AAR) are also rewritten and contribute to `getApiStats()`.
  *
  * **Cross-scope duplicate-class dedupe (v2.0.3+):** there is a known
  * AGP 4.x trap when a Transform's main scope includes

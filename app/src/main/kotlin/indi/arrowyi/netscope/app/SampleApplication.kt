@@ -10,7 +10,7 @@ class SampleApplication : Application() {
         NetScope.init(this)
         NetScope.setLogInterval(30)
         NetScope.setOnFlowEnd { stats ->
-            Log.d("NetScope-App", "Flow ended: ${stats.domain} ↑${stats.txBytesInterval} ↓${stats.rxBytesInterval}")
+            Log.d("NetScope-App", "Flow ended: ${stats.key} ↑${stats.txBytesInterval} ↓${stats.rxBytesInterval}")
         }
     }
 }

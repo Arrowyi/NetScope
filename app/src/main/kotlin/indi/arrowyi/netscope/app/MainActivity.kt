@@ -46,8 +46,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshStats() {
         val sb = StringBuilder()
-        NetScope.getDomainStats().forEach { s ->
-            sb.appendLine("${s.domain}")
+        NetScope.getApiStats().forEach { s ->
+            sb.appendLine(s.key)
             sb.appendLine("  ↑${fmtBytes(s.txBytesTotal)}  ↓${fmtBytes(s.rxBytesTotal)}  conn=${s.connCountTotal}")
         }
         findViewById<TextView>(R.id.tvStats).text = sb.toString().ifEmpty { "No traffic yet" }

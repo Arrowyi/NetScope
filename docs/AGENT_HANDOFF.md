@@ -11,6 +11,65 @@
 
 ## Changelog
 
+### v3.0.0 (2026-04-24) — BREAKING
+
+Per-domain (`host`) becomes **per-API (`host` + `path`)**. The v2.x
+data model called out every entry as a `DomainStats` keyed on one
+hostname. That is insufficient for HMIs that need to tell which
+endpoint on a shared host is expensive — `/v1/location` vs
+`/v1/map-tiles` on `api.example.com` both rolled up to one row.
+
+v3.0.0 introduces:
+
+1. **`ApiStats`**, the new data class. Fields: `host`, `path`, `key`
+   (`= "$host$path"`), plus all the byte/conn/time counters that
+   `DomainStats` had. `DomainStats` is removed.
+2. **`NetScope.getApiStats()`** replaces `getDomainStats()`.
+   `getIntervalStats()` keeps its name but changes element type.
+   `setOnFlowEnd` receives an `ApiStats`.
+3. **Host with port-fallback.** The `host` field of `ApiStats` is the
+   formatted endpoint — raw host when the scheme default port is in
+   use (HTTPS `:443` / HTTP `:80` elided), or `host:port` for anything
+   else. Raw IPs pass through verbatim (`192.168.1.5:9000`). If the
+   URL has no resolvable host at all we emit `<unknown>` (optionally
+   `<unknown>:port`). `EndpointFormatter` is the single choke-point.
+4. **Path normalization.** Paths go through `PathNormalizer`:
+   numeric IDs → `:id`, UUIDs → `:uuid`, long hex strings → `:hash`,
+   query/fragment stripped, consecutive slashes collapsed, trailing
+   slash dropped, missing leading `/` added. So `/users/123/posts/456`
+   becomes `/users/:id/posts/:id` and `GET /foo` merges with
+   `POST /foo`.
+5. **Bytecode change (callers must rebuild).** The
+   `OkHttpWebSocketInstrumenter` now pushes a 3-arg `wrapListener`
+   and a 3-arg `wrapWebSocket` (endpoint, path, x). Plugin v3.0.0
+   paired with SDK ≤ v2.x (or vice versa) will fail at link time
+   with `NoSuchMethodError`. Coordinate version bumps accordingly.
+
+### Golden rule update — AOP-G14
+
+`getApiStats()` returns ONE row per `(host, path)` tuple. If you're
+about to add a new granularity knob (query string? header? method?)
+stop and re-read the brainstorming notes under
+`docs/superpowers/specs/` first — v3.0.0 deliberately keeps the
+aggregation key to two strings so the in-memory footprint stays flat
+even for HMIs that talk to dozens of APIs. New granularity should be
+opt-in via a pluggable `PathNormalizer` interface, not a fourth key
+dimension in the hot path.
+
+### Golden rule update — AOP-G15
+
+`EndpointFormatter` owns the canonical host-string shape. Integration
+wrappers (`NetScopeInterceptor`, `NetScopeUrlConnection`,
+`NetScopeWebSocket`) MUST NOT format hosts themselves. Any new
+integration point (raw socket, Retrofit converter, ...) must resolve
+`(host, port, defaultPortForScheme)` and hand them to
+`EndpointFormatter.format(...)`. Centralising this keeps dedupe across
+sources working (an OkHttp hit to `api.example.com:443` must collapse
+with an HttpsURLConnection hit to the same address).
+
+Coordinates: `com.github.Arrowyi.NetScope:NetScope:v3.0.0` and
+`com.github.Arrowyi.NetScope:NetScope-plugin:v3.0.0`.
+
 ### v2.0.3 (2026-04-24)
 
 One build-breaker fix consumers should know about:
@@ -95,12 +154,12 @@ the host app:
 - **Layer A — total kernel-level UID traffic since `init()`**, obtained
   from `android.net.TrafficStats.getUid{Tx,Rx}Bytes` minus a baseline
   captured at `init()`. Covers Java + native + NDK + raw sockets.
-- **Layer B — per-domain Java-layer breakdown**, obtained from
-  build-time ASM instrumentation of OkHttp, HttpsURLConnection, and
-  OkHttp WebSocket call sites.
+- **Layer B — per-API (host + path) Java-layer breakdown** (v3.0.0+),
+  obtained from build-time ASM instrumentation of OkHttp,
+  HttpsURLConnection, and OkHttp WebSocket call sites.
 
 ```
-sum(getDomainStats().tx)  <=  getTotalStats().txTotal
+sum(getApiStats().tx)  <=  getTotalStats().txTotal
 ```
 
 The gap is non-instrumented traffic (most often a native HTTP client).
@@ -125,11 +184,13 @@ NetScope/
 │   └── src/main/kotlin/indi/arrowyi/netscope/sdk/
 │       ├── NetScope.kt           ← public entry point (Layer A + Layer B)
 │       ├── Status.kt             ← { NOT_INITIALIZED, ACTIVE }
-│       ├── DomainStats.kt        ← per-domain row (Layer B, data class)
+│       ├── ApiStats.kt           ← per-API (host+path) row (Layer B, data class, v3.0.0+)
 │       ├── TotalStats.kt         ← kernel-level UID total (Layer A)
 │       ├── LogcatReporter.kt     ← optional periodic adb logcat
 │       ├── internal/
-│       │   ├── TrafficAggregator.kt   ← per-domain AtomicLong counters
+│       │   ├── TrafficAggregator.kt   ← per-API AtomicLong counters (keyed host\u0000path)
+│       │   ├── EndpointFormatter.kt   ← host[:port] / <unknown> fallback (v3.0.0+)
+│       │   ├── PathNormalizer.kt      ← :id / :uuid / :hash templating (v3.0.0+)
 │       │   └── SystemTrafficReader.kt ← TrafficStats seam (testable)
 │       └── integration/
 │           ├── NetScopeInstrumented.kt  ← marker interface (anti-double-wrap)
@@ -172,8 +233,10 @@ class of bug we've already closed.
 | AOP-G9 | (OBSOLETE after v2.0.2) Don't use `ClassWriter.COMPUTE_FRAMES` in `NetScopeTransform`. Use `COMPUTE_MAXS` only, and never rewrite a class that doesn't contain a target call site (see G10). | The `getCommonSuperClass` fallback used to be the workaround; G10 + G11 together remove the need. |
 | AOP-G10 | `NetScopeTransform.tryTransform()` MUST prefilter with the readonly `needsRewrite()` visitor and return `null` (= byte-for-byte passthrough) when the class contains none of our three target `INVOKEVIRTUAL`s. | v2.0.1 piped every class through `ClassReader -> ClassWriter` unconditionally, which is *not* byte-for-byte identical even when no visitor changed anything. On HMI Denali, that produced classes D8 refused with `Invalid descriptor char 'N'`. |
 | AOP-G11 | `ClassWriter` must be built with `COMPUTE_MAXS`, not `COMPUTE_FRAMES`. Our instrumenters only insert straight-line `INVOKESTATIC` + `DUP` sequences; they never add branch targets or new frame-crossing types. | `COMPUTE_FRAMES` forces ASM into `getCommonSuperClass()`, which runs `Class.forName(...)` on user classes through the plugin's classloader — those aren't visible there, wrong answers silently corrupt the StackMapTable, and D8 later trips on the dex frame table. |
-| AOP-G12 | `getTotalStats()` reads kernel-level `TrafficStats.getUid{Tx,Rx}Bytes(myUid)` minus a baseline captured at `init()`. `getDomainStats()` stays AOP-only. By design `sum(getDomainStats().tx) <= getTotalStats().txTotal`. | Historical `getTotalStats()` was `sum(AOP domains)` — invisible to native HTTP clients. v2.0.2 gives HMIs the kernel truth without us shipping a native library. |
+| AOP-G12 | `getTotalStats()` reads kernel-level `TrafficStats.getUid{Tx,Rx}Bytes(myUid)` minus a baseline captured at `init()`. `getApiStats()` stays AOP-only. By design `sum(getApiStats().tx) <= getTotalStats().txTotal`. | Historical `getTotalStats()` was `sum(AOP)` — invisible to native HTTP clients. v2.0.2 gives HMIs the kernel truth without us shipping a native library. |
 | AOP-G13 | `NetScopeTransform.getScopes()` is `{PROJECT, SUB_PROJECTS, EXTERNAL_LIBRARIES}` AND `transform()` implements scope-priority dedupe on class internal names (`PROJECT > SUB_PROJECTS > EXTERNAL_LIBRARIES`). The Transform is non-incremental. Never "simplify" the dedupe away or switch back to incremental. | Two opposing forces. (a) HMIs ship vendor AARs (`:search`, `:map`) with heavy HTTP — dropping EXTERNAL_LIBRARIES from scope under-reports Layer B. (b) When EXTERNAL_LIBRARIES is a main scope on AGP 4.x, all inputs collapse into `mixed_scope_dex_archive/` and AGP's default per-scope dedupe stops working, so cross-module same-named classes (e.g. two `com.foo.BuildConfig` from a local module and a vendor AAR) collide with `D8: Type ... is defined multiple times`. Doing the dedupe ourselves, in priority order, is the only way to keep both properties. Incremental builds would need a persisted seen-set which adds fragility without much win. |
+| AOP-G14 | The `(host, path)` tuple is the ONLY aggregation key in the hot path. New granularity dimensions (method, query, header, …) must go through a pluggable `PathNormalizer`-style interface, not a third hash-map key. | Aggregator footprint is linear in the number of distinct keys. A fourth dimension doubles memory budget for every HMI that talks to dozens of APIs — unacceptable on constrained head-units. |
+| AOP-G15 | All host-string formatting goes through `EndpointFormatter.format(host, port, defaultPort)`. Integration wrappers MUST NOT concatenate `host` + `:port` themselves, and MUST NOT invent their own `<unknown>` fallback. | Centralising this keeps dedupe across sources working. If an OkHttp call and an HttpsURLConnection call both target `api.example.com:443`, they must collapse to the same `host` string (`api.example.com`) — a local format bug anywhere in the integration layer silently splits them. |
 
 ---
 
@@ -184,7 +247,7 @@ class of bug we've already closed.
 1. **Confirm the Transform ran.** `grep 'registered Transform' app/build/...` in the build log. If absent, the `indi.arrowyi.netscope` plugin was not applied in the consumer module.
 2. **Confirm the instrumentation fired.** Inspect a known OkHttp caller class: `javap -c -p app/build/intermediates/transforms/netscope/.../MyActivity.class | grep NetScopeInterceptorInjector`. If absent, check the skip list (`shouldSkipClass` in [NetScopeTransform.kt](../netscope-plugin/src/main/kotlin/indi/arrowyi/netscope/plugin/NetScopeTransform.kt)) — the caller's package may be inadvertently excluded.
 3. **Confirm the SDK is initialized.** `NetScope.status()` must return `ACTIVE`. If `NOT_INITIALIZED`, the consumer never called `NetScope.init(context)`.
-4. **Confirm no one is wrapping twice.** `NetScope.getDomainStats()` showing ~2× the expected bytes → someone bypassed the marker. Grep for manual `addInterceptor(NetScopeInterceptor)` AND Transform-injected path both hitting the same builder.
+4. **Confirm no one is wrapping twice.** `NetScope.getApiStats()` showing ~2× the expected bytes → someone bypassed the marker. Grep for manual `addInterceptor(NetScopeInterceptor)` AND Transform-injected path both hitting the same builder.
 5. **Ask whether the traffic is Java-side.** Telenav's `asdk.httpclient`, Chromium WebViews, native sockets opened via NDK — none of those are in scope. `total = NetScope.getTotalStats() + <their stats>` is the contract.
 
 ### 4.2 You want to add a new instrumentation target (e.g. Apache HttpClient)
@@ -196,7 +259,7 @@ Checklist:
 3. Chain it into `tryTransform`'s ClassVisitor chain in [NetScopeTransform.kt](../netscope-plugin/src/main/kotlin/indi/arrowyi/netscope/plugin/NetScopeTransform.kt).
 4. Update `shouldSkipClass()` if the target library's own package needs excluding (see AOP-G5).
 5. Unit-test: feed a crafted call site through ASM, assert the rewritten bytecode contains `INVOKESTATIC indi/arrowyi/netscope/sdk/integration/...`.
-6. Integration-test: apply the plugin to `app/`, make one call through the target library, assert `getDomainStats()` populated.
+6. Integration-test: apply the plugin to `app/`, make one call through the target library, assert `getApiStats()` populated with the expected `(host, path)` key.
 
 ### 4.3 You are building on AGP 7.x / 8.x and want the new `AsmClassVisitorFactory` path
 
@@ -220,11 +283,11 @@ object NetScope {
     fun status(): Status                       // NOT_INITIALIZED / ACTIVE
     fun pause(); fun resume()
     fun clearStats(); fun markIntervalBoundary()
-    fun getDomainStats(): List<DomainStats>    // Layer B: AOP per domain
-    fun getIntervalStats(): List<DomainStats>  // Layer B: last interval
+    fun getApiStats(): List<ApiStats>          // Layer B: AOP per (host, path)  — v3.0.0+
+    fun getIntervalStats(): List<ApiStats>     // Layer B: last interval          — v3.0.0+
     fun getTotalStats(): TotalStats            // Layer A: kernel UID total since init()
     fun setLogInterval(seconds: Int)
-    fun setOnFlowEnd(cb: ((DomainStats) -> Unit)?)
+    fun setOnFlowEnd(cb: ((ApiStats) -> Unit)?)
     fun destroy()
 }
 ```
@@ -269,7 +332,7 @@ HMI consumes with:
 buildscript {
   repositories { maven { url 'https://jitpack.io' } }
   dependencies {
-    classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.3'
+    classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v3.0.0'
   }
 }
 
@@ -277,7 +340,7 @@ buildscript {
 apply plugin: 'indi.arrowyi.netscope'   // AFTER AspectJ, per AOP-G4
 
 dependencies {
-  implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.3'
+  implementation 'com.github.Arrowyi.NetScope:NetScope:v3.0.0'
 }
 ```
 

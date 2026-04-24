@@ -33,7 +33,7 @@ internal object LogcatReporter {
     private fun printReport() {
         NetScope.markIntervalBoundary()
         val rawInterval = NetScope.getIntervalStats()
-        val rawCumulative = NetScope.getDomainStats()
+        val rawCumulative = NetScope.getApiStats()
         val total = NetScope.getTotalStats()
         val interval = rawInterval
             .filter { it.txBytesInterval + it.rxBytesInterval > 0 }
@@ -44,13 +44,13 @@ internal object LogcatReporter {
         Log.i(TAG, "══════ Traffic Report [$ts] ══════")
         Log.i(TAG, "── Interval ──────────────────────────────")
         interval.forEach { s ->
-            Log.i(TAG, "  %-40s ↑%-10s ↓%-10s conn=%d".format(
-                s.domain, fmtBytes(s.txBytesInterval), fmtBytes(s.rxBytesInterval), s.connCountInterval))
+            Log.i(TAG, "  %-60s ↑%-10s ↓%-10s conn=%d".format(
+                s.key, fmtBytes(s.txBytesInterval), fmtBytes(s.rxBytesInterval), s.connCountInterval))
         }
         Log.i(TAG, "── Cumulative ────────────────────────────")
         rawCumulative.forEach { s ->
-            Log.i(TAG, "  %-40s ↑%-10s ↓%-10s conn=%d".format(
-                s.domain, fmtBytes(s.txBytesTotal), fmtBytes(s.rxBytesTotal), s.connCountTotal))
+            Log.i(TAG, "  %-60s ↑%-10s ↓%-10s conn=%d".format(
+                s.key, fmtBytes(s.txBytesTotal), fmtBytes(s.rxBytesTotal), s.connCountTotal))
         }
         Log.i(TAG, "── Total (kernel UID, since init) ────────")
         Log.i(TAG, "  ↑%s  ↓%s  conn=%d".format(

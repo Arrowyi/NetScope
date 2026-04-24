@@ -10,17 +10,19 @@ import org.objectweb.asm.Opcodes
  * callsite so that:
  *
  *   1. the `WebSocketListener` argument is replaced by
- *      `NetScopeWebSocket.wrapListener(host, listener)`
+ *      `NetScopeWebSocket.wrapListener(endpoint, path, listener)`
  *      — to count inbound frames;
  *   2. the returned `WebSocket` is replaced by
- *      `NetScopeWebSocket.wrapWebSocket(host, ws)`
+ *      `NetScopeWebSocket.wrapWebSocket(endpoint, path, ws)`
  *      — to count outbound frames on `send(...)`.
  *
- * `host` is extracted from the `Request` via
- * `NetScopeWebSocket.hostOf(Request) : String`. This requires
- * duplicating the `Request` reference on the stack.
+ * `endpoint` (host optionally with `:port`) and `path` (normalised URL
+ * path) are extracted from the `Request` via
+ * `NetScopeWebSocket.endpointOf(Request) : String` and
+ * `NetScopeWebSocket.pathOf(Request) : String`. Both are invoked once
+ * per call site and the results stashed in local slots.
  *
- * Bytecode plan at the call site (stack notation, top on the right):
+ * Stack/local plan at the call site (top of stack on the right):
  *
  * Original:
  *   ..., client, request, listener
@@ -29,28 +31,31 @@ import org.objectweb.asm.Opcodes
  *
  * Rewritten:
  *   ..., client, request, listener
- *   ; wrap listener:
- *   SWAP                            ; ..., client, listener, request
- *   DUP                             ; ..., client, listener, request, request
- *   INVOKESTATIC  hostOf            ; ..., client, listener, request, host
- *   DUP_X2                          ; ..., client, host, listener, request, host
- *   POP                             ; ..., client, host, listener, request
- *   SWAP                            ; ..., client, host, request, listener
- *   ; now we need host available AGAIN as arg0 for wrapListener,
- *   ; but it's three slots deep. Simpler: use a LocalVar slot.
+ *   ASTORE slotListener                 ; ..., client, request
+ *   ASTORE slotRequest                  ; ..., client
+ *   ALOAD  slotRequest                  ; ..., client, request
+ *   INVOKESTATIC endpointOf             ; ..., client, endpoint
+ *   ASTORE slotEndpoint                 ; ..., client
+ *   ALOAD  slotRequest                  ; ..., client, request
+ *   INVOKESTATIC pathOf                 ; ..., client, path
+ *   ASTORE slotPath                     ; ..., client
+ *   ALOAD  slotRequest                  ; ..., client, request
+ *   ALOAD  slotEndpoint                 ; ..., client, request, endpoint
+ *   ALOAD  slotPath                     ; ..., client, request, endpoint, path
+ *   ALOAD  slotListener                 ; ..., client, request, endpoint, path, listener
+ *   INVOKESTATIC wrapListener           ; ..., client, request, wrappedListener
+ *   INVOKEVIRTUAL newWebSocket          ; ..., webSocket
+ *   ALOAD  slotEndpoint
+ *   SWAP                                ; ..., endpoint, webSocket → endpoint, ws on top
+ *   ; actually we push in order (endpoint, path, ws):
+ *   ALOAD  slotPath
+ *   SWAP                                ; ..., endpoint, path, ws
+ *   INVOKESTATIC wrapWebSocket          ; ..., wrappedWebSocket
  *
- * The swap dance is ugly. A much cleaner implementation stores the
- * `Request` and `listener` into local-variable slots. That is what we
- * do. It takes 2 free slots; we allocate using [newLocal] via
- * `asm-commons` LocalVariablesSorter... but importing that for this
- * one use case bloats the plugin. Instead we use ASM's low-level local
- * index by picking a high arbitrary index and relying on
- * `COMPUTE_MAXS` to widen the method's local-var count.
- *
- * Implementation uses `visitVarInsn` ASTORE/ALOAD into slots
- * `maxLocalSlot + 1` and `+ 2`; since this method reserves only a
- * small window around one bytecode instruction, stack frames stay
- * trivially verifiable. `COMPUTE_MAXS` fixes the frame size.
+ * Slots used: `slotRequest`, `slotListener`, `slotEndpoint`, `slotPath`.
+ * Picked far above any realistic method's own locals; COMPUTE_MAXS
+ * widens maxLocals. Stack frames stay trivially verifiable because we
+ * reserve only a small window around one bytecode instruction.
  */
 internal class OkHttpWebSocketInstrumenter(
     api: Int,
@@ -75,11 +80,12 @@ internal class OkHttpWebSocketInstrumenter(
         private val log: Logger
     ) : MethodVisitor(api, mv) {
 
-        // Use slots far above anything a sane method uses for its own
-        // locals. COMPUTE_MAXS will expand maxLocals accordingly.
-        private val slotRequest = 200
+        // Slots far above anything a sane method uses. COMPUTE_MAXS
+        // expands maxLocals to cover.
+        private val slotRequest  = 200
         private val slotListener = 202
-        private val slotHost = 204
+        private val slotEndpoint = 204
+        private val slotPath     = 206
 
         override fun visitMethodInsn(
             opcode: Int, ownerIn: String, nameIn: String,
@@ -100,22 +106,31 @@ internal class OkHttpWebSocketInstrumenter(
             super.visitVarInsn(Opcodes.ASTORE, slotListener)  // ..., client, request
             super.visitVarInsn(Opcodes.ASTORE, slotRequest)   // ..., client
 
-            // Compute host.
+            // endpoint = NetScopeWebSocket.endpointOf(request)
             super.visitVarInsn(Opcodes.ALOAD, slotRequest)
             super.visitMethodInsn(
-                Opcodes.INVOKESTATIC, HELPER, "hostOf",
+                Opcodes.INVOKESTATIC, HELPER, "endpointOf",
                 "(Lokhttp3/Request;)Ljava/lang/String;", false
             )
-            super.visitVarInsn(Opcodes.ASTORE, slotHost)
+            super.visitVarInsn(Opcodes.ASTORE, slotEndpoint)
 
-            // Push wrapped listener.
-            // wrapListener(host, listener) -> WebSocketListener
+            // path = NetScopeWebSocket.pathOf(request)
+            super.visitVarInsn(Opcodes.ALOAD, slotRequest)
+            super.visitMethodInsn(
+                Opcodes.INVOKESTATIC, HELPER, "pathOf",
+                "(Lokhttp3/Request;)Ljava/lang/String;", false
+            )
+            super.visitVarInsn(Opcodes.ASTORE, slotPath)
+
+            // Push wrapped listener:
+            // wrapListener(endpoint, path, listener) -> WebSocketListener
             super.visitVarInsn(Opcodes.ALOAD, slotRequest)    // ..., client, request
-            super.visitVarInsn(Opcodes.ALOAD, slotHost)
+            super.visitVarInsn(Opcodes.ALOAD, slotEndpoint)
+            super.visitVarInsn(Opcodes.ALOAD, slotPath)
             super.visitVarInsn(Opcodes.ALOAD, slotListener)
             super.visitMethodInsn(
                 Opcodes.INVOKESTATIC, HELPER, "wrapListener",
-                "(Ljava/lang/String;Lokhttp3/WebSocketListener;)Lokhttp3/WebSocketListener;",
+                "(Ljava/lang/String;Ljava/lang/String;Lokhttp3/WebSocketListener;)Lokhttp3/WebSocketListener;",
                 false
             )
             // Stack: ..., client, request, wrappedListener
@@ -124,12 +139,16 @@ internal class OkHttpWebSocketInstrumenter(
             super.visitMethodInsn(opcode, ownerIn, nameIn, descriptorIn, isInterface)
             // Stack: ..., webSocket
 
-            // Wrap the returned WebSocket.
-            super.visitVarInsn(Opcodes.ALOAD, slotHost)
-            super.visitInsn(Opcodes.SWAP)                     // ..., host, ws
+            // Wrap the returned WebSocket:
+            // wrapWebSocket(endpoint, path, ws) -> WebSocket
+            // Stack target before the call: ..., endpoint, path, ws
+            super.visitVarInsn(Opcodes.ALOAD, slotEndpoint)   // ..., ws, endpoint
+            super.visitInsn(Opcodes.SWAP)                     // ..., endpoint, ws
+            super.visitVarInsn(Opcodes.ALOAD, slotPath)       // ..., endpoint, ws, path
+            super.visitInsn(Opcodes.SWAP)                     // ..., endpoint, path, ws
             super.visitMethodInsn(
                 Opcodes.INVOKESTATIC, HELPER, "wrapWebSocket",
-                "(Ljava/lang/String;Lokhttp3/WebSocket;)Lokhttp3/WebSocket;",
+                "(Ljava/lang/String;Ljava/lang/String;Lokhttp3/WebSocket;)Lokhttp3/WebSocket;",
                 false
             )
             // Stack: ..., wrappedWs
