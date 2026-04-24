@@ -101,6 +101,33 @@ the same `api.example.com` on two different ports splits into two API
 entries, which matches what the kernel / network actually treats them
 as.
 
+### Which URLs get counted (v3.0.1+)
+
+The Gradle Transform rewrites *every* `URLConnection.getInputStream()`
+/ `getOutputStream()` call site in the app. At runtime NetScope
+classifies the connection's URL before wrapping:
+
+| URL | Counted? | Rationale |
+|---|---|---|
+| `http://…`, `https://…` | yes | obvious |
+| `ftp://…`, `sftp://…`, custom socket schemes | yes | touches the wire |
+| `jar:http://host/x.jar!/entry` | yes | inner URL is remote |
+| `file:/data/…` | no | local filesystem |
+| `content://…` | no | Android ContentProvider |
+| `asset:`, `android.resource:`, `res:`, `data:` | no | local |
+| `jar:file:/…!/entry` | no | inner URL is local |
+
+Rule (**AOP-G16**): local-scheme *denylist* rather than http(s)
+*allowlist*. If a new over-the-wire transport appears (say `quic:`),
+it will be counted by default — the denylist bias is deliberately
+conservative about missing traffic and liberal about counting it.
+
+This is the fix for the common "my total bytes include the app
+reading its own assets" complaint — those reads never showed up in
+`getTotalStats()` (the kernel doesn't count local FS reads as
+network), but they used to leak into `getApiStats()` under an
+`<unknown>/…` row.
+
 ### Why this architecture
 
 The previous native-hook implementation (bytehook / shadowhook) is
@@ -150,7 +177,7 @@ buildscript {
         // groupId is `com.github.Arrowyi.NetScope` (DOT, not colon) —
         // JitPack multi-module convention because both artifacts come
         // from the same repo.
-        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v3.0.0'
+        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v3.0.1'
     }
 }
 ```
@@ -166,12 +193,15 @@ apply plugin: 'kotlin-android'
 apply plugin: 'indi.arrowyi.netscope'
 
 dependencies {
-    implementation 'com.github.Arrowyi.NetScope:NetScope:v3.0.0'
+    implementation 'com.github.Arrowyi.NetScope:NetScope:v3.0.1'
 }
 ```
 
-The `v3.0.0` tag is pinned. **v3.0.0 is a breaking change** — see
-[Migrating from v2 → v3](#migrating-from-v2--v3). For other releases, pick a tag from
+The `v3.0.1` tag is pinned. **v3.0.0 was a breaking change** (see
+[Migrating from v2 → v3](#migrating-from-v2--v3)); v3.0.1 tightens
+the URL scheme policy so local-filesystem reads aren't counted as
+network traffic (AOP-G16). No source-level migration needed from
+v3.0.0. For other releases, pick a tag from
 [Releases](https://github.com/Arrowyi/NetScope/releases) or an exact
 short SHA from
 [github.com/Arrowyi/NetScope/commits/main](https://github.com/Arrowyi/NetScope/commits/main).

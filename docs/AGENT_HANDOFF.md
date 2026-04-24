@@ -11,6 +11,25 @@
 
 ## Changelog
 
+### v3.0.1 (2026-04-24)
+
+One behaviour fix. `URLConnection` users are rewritten by the Transform
+regardless of scheme, so at runtime we also saw `file:`, `content:`,
+`asset:`, `data:`, `android.resource:`, and `jar:file:…` streams
+flowing through `NetScopeUrlConnection.wrapInputStream`. Those are
+**local** sources, never touch the radio, and must not be attributed
+as network traffic.
+
+v3.0.1 adds a local-scheme denylist (new rule **AOP-G16**). The policy
+is "skip if local" rather than "only allow http(s)" — that keeps
+genuine over-the-wire transports like `ftp:`, `sftp:`, and any custom
+socket-backed scheme counted. `jar:` is resolved by inner URL, so
+`jar:file:/…` is local but `jar:http://cdn/…!/x` counts.
+
+Coordinates: `com.github.Arrowyi.NetScope:NetScope:v3.0.1` and
+`com.github.Arrowyi.NetScope:NetScope-plugin:v3.0.1`. Pure SDK change,
+plugin bytecode unchanged — version bumped in lockstep for clarity.
+
 ### v3.0.0 (2026-04-24) — BREAKING
 
 Per-domain (`host`) becomes **per-API (`host` + `path`)**. The v2.x
@@ -237,6 +256,7 @@ class of bug we've already closed.
 | AOP-G13 | `NetScopeTransform.getScopes()` is `{PROJECT, SUB_PROJECTS, EXTERNAL_LIBRARIES}` AND `transform()` implements scope-priority dedupe on class internal names (`PROJECT > SUB_PROJECTS > EXTERNAL_LIBRARIES`). The Transform is non-incremental. Never "simplify" the dedupe away or switch back to incremental. | Two opposing forces. (a) HMIs ship vendor AARs (`:search`, `:map`) with heavy HTTP — dropping EXTERNAL_LIBRARIES from scope under-reports Layer B. (b) When EXTERNAL_LIBRARIES is a main scope on AGP 4.x, all inputs collapse into `mixed_scope_dex_archive/` and AGP's default per-scope dedupe stops working, so cross-module same-named classes (e.g. two `com.foo.BuildConfig` from a local module and a vendor AAR) collide with `D8: Type ... is defined multiple times`. Doing the dedupe ourselves, in priority order, is the only way to keep both properties. Incremental builds would need a persisted seen-set which adds fragility without much win. |
 | AOP-G14 | The `(host, path)` tuple is the ONLY aggregation key in the hot path. New granularity dimensions (method, query, header, …) must go through a pluggable `PathNormalizer`-style interface, not a third hash-map key. | Aggregator footprint is linear in the number of distinct keys. A fourth dimension doubles memory budget for every HMI that talks to dozens of APIs — unacceptable on constrained head-units. |
 | AOP-G15 | All host-string formatting goes through `EndpointFormatter.format(host, port, defaultPort)`. Integration wrappers MUST NOT concatenate `host` + `:port` themselves, and MUST NOT invent their own `<unknown>` fallback. | Centralising this keeps dedupe across sources working. If an OkHttp call and an HttpsURLConnection call both target `api.example.com:443`, they must collapse to the same `host` string (`api.example.com`) — a local format bug anywhere in the integration layer silently splits them. |
+| AOP-G16 | Only **network** URLs are counted by `NetScopeUrlConnection`. Local-scheme denylist: `file`, `content`, `asset`, `android.resource`, `android-app`, `data`, `res`, `resource`. `jar:` is resolved by inner URL. Everything else (including `ftp`, `sftp`, `gopher`, custom socket-backed schemes) is treated as network. The policy is denylist, not allowlist: if a new over-the-wire transport shows up (e.g. `quic:`), it should be counted by default. | The Transform rewrites `URLConnection.getInputStream()` unconditionally, so at runtime we also receive streams for local-filesystem reads, ContentProvider queries, asset pipes, and data URIs. Attributing those as network traffic produces spurious `<unknown>/data/app/…` rows and inflates `sum(ApiStats.tx)` well past `getTotalStats().txTotal`. A denylist (rather than an http/https allowlist) ensures genuine network transports aren't silently dropped. |
 
 ---
 
@@ -332,7 +352,7 @@ HMI consumes with:
 buildscript {
   repositories { maven { url 'https://jitpack.io' } }
   dependencies {
-    classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v3.0.0'
+    classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v3.0.1'
   }
 }
 
@@ -340,7 +360,7 @@ buildscript {
 apply plugin: 'indi.arrowyi.netscope'   // AFTER AspectJ, per AOP-G4
 
 dependencies {
-  implementation 'com.github.Arrowyi.NetScope:NetScope:v3.0.0'
+  implementation 'com.github.Arrowyi.NetScope:NetScope:v3.0.1'
 }
 ```
 
