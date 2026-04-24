@@ -1,24 +1,27 @@
 package indi.arrowyi.netscope.sdk
 
 /**
- * Sum of traffic observed by NetScope across every domain since
- * [NetScope.init] / last [NetScope.clearStats].
+ * Kernel-level total traffic for the app's UID since [NetScope.init] /
+ * last [NetScope.clearStats].
  *
- * NetScope only sees traffic that passes through a build-time
- * instrumented Java code path (OkHttp, HttpsURLConnection, OkHttp
- * WebSocket). Traffic originating from native C/C++ HTTP clients
- * (e.g. Telenav's `asdk.httpclient`) is counted by that library's own
- * stats, NOT here.
+ * **Data source (v2.0.2+):** `android.net.TrafficStats.getUid{Tx,Rx}Bytes`
+ * minus a baseline snapshot captured at [NetScope.init]. Covers
+ * everything the kernel attributes to our UID — Java, Kotlin, C++,
+ * NDK, signed native blobs, raw sockets — whether or not NetScope's
+ * ASM instrumentation saw it. This is the "Layer A" number.
  *
- * The integration contract is therefore:
+ * By contrast [DomainStats] (from [NetScope.getDomainStats]) is
+ * "Layer B" — only what the AOP-instrumented Java paths saw. The
+ * invariant `sum(DomainStats.totalBytes) <= TotalStats.totalBytes` is
+ * intentional; the delta is non-instrumented (usually native)
+ * traffic.
  *
- * ```
- *   total_app_traffic = NetScope.getTotalStats()  +  <native-stack stats>
- * ```
- *
- * @param txTotal       cumulative bytes sent  across all domains
- * @param rxTotal       cumulative bytes received across all domains
- * @param connCountTotal cumulative number of CLOSED flows across all domains
+ * @param txTotal        kernel-counted bytes sent since init
+ * @param rxTotal        kernel-counted bytes received since init
+ * @param connCountTotal AOP-observed Java-layer flow-close count.
+ *                       Remains a Java-only figure because the kernel
+ *                       has no "connection close" concept for native
+ *                       sockets.
  */
 data class TotalStats(
     val txTotal: Long,

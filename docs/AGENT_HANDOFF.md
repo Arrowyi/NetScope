@@ -9,20 +9,61 @@
 > [BYTEHOOK_LESSONS.md](BYTEHOOK_LESSONS.md) for the postmortem and
 > [HOOK_EVOLUTION.md](HOOK_EVOLUTION.md) for the historical chronicle.
 
+## Changelog
+
+### v2.0.2 (2026-04-24)
+
+Two behaviour changes consumers should know about:
+
+1. **D8 / dexing crash fix (AOP-G10 / AOP-G11).** v2.0.1 rewrote every
+   class through `ClassReader → ClassVisitor chain → ClassWriter`
+   regardless of whether the class contained a target call site.
+   That round-trip is *not* byte-for-byte identical (ASM normalises
+   constant pool order, attribute emission, etc.) and produced
+   `Invalid descriptor char 'N'` when D8 tried to dex some untouched
+   business classes on Denali. `NetScopeTransform.tryTransform()` now
+   prefilters with a readonly `needsRewrite()` visitor — only classes
+   that actually call one of the three targets are rewritten. The
+   `ClassWriter` flag was also downgraded from `COMPUTE_FRAMES` to
+   `COMPUTE_MAXS`, removing the need for the `getCommonSuperClass`
+   fallback.
+
+2. **`getTotalStats()` now returns kernel-level UID traffic
+   (AOP-G12).** Previously it returned `sum(AOP domains)`, which
+   invisibly missed traffic from native HTTP clients. It now reads
+   `android.net.TrafficStats.getUid{Tx,Rx}Bytes(myUid)` minus a
+   baseline captured at `init()`, so the number covers Java + native
+   + NDK. `getDomainStats()` remains AOP-only (Java HTTP/S). HMIs can
+   compute `total.totalBytes - sum(getDomainStats().totalBytes)` to
+   surface the un-attributed gap. Pre-Q OEM kernels returning
+   `TrafficStats.UNSUPPORTED` transparently fall back to the AOP sum.
+
+Coordinates: `com.github.Arrowyi.NetScope:NetScope:v2.0.2` and
+`com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.2`.
+
 ---
 
 ## 1. What NetScope is, now
 
-NetScope is an Android SDK that collects **per-domain Java-layer
-network traffic statistics** for the embedding app by instrumenting
-OkHttp, HttpsURLConnection, and OkHttp WebSocket at **build time** via
-a Gradle Transform plugin. It observes only Java-layer traffic; native
-HTTP clients (e.g. Telenav `asdk.httpclient`) are counted by their
-own stacks.
+NetScope is an Android SDK that reports, with zero source changes to
+the host app:
+
+- **Layer A — total kernel-level UID traffic since `init()`**, obtained
+  from `android.net.TrafficStats.getUid{Tx,Rx}Bytes` minus a baseline
+  captured at `init()`. Covers Java + native + NDK + raw sockets.
+- **Layer B — per-domain Java-layer breakdown**, obtained from
+  build-time ASM instrumentation of OkHttp, HttpsURLConnection, and
+  OkHttp WebSocket call sites.
 
 ```
-total_app_traffic  =  NetScope.getTotalStats()  +  <native stack's own stats>
+sum(getDomainStats().tx)  <=  getTotalStats().txTotal
 ```
+
+The gap is non-instrumented traffic (most often a native HTTP client).
+HMIs that care about attribution render the gap explicitly. HMIs that
+just want "total app traffic" read `getTotalStats()` directly — it now
+subsumes the old `total = NetScope.getTotalStats() + <native stack>`
+formula.
 
 The SDK is pure Kotlin. There is no `libnetscope.so`, no bytehook, no
 shadowhook. `DT_NEEDED` is empty of third-party libs. There is no
@@ -38,13 +79,14 @@ Transform.
 NetScope/
 ├── netscope-sdk/                 ← AAR. Pure Kotlin, zero .so.
 │   └── src/main/kotlin/indi/arrowyi/netscope/sdk/
-│       ├── NetScope.kt           ← public entry point
+│       ├── NetScope.kt           ← public entry point (Layer A + Layer B)
 │       ├── Status.kt             ← { NOT_INITIALIZED, ACTIVE }
-│       ├── DomainStats.kt        ← per-domain row (data class)
-│       ├── TotalStats.kt         ← sum across all domains
+│       ├── DomainStats.kt        ← per-domain row (Layer B, data class)
+│       ├── TotalStats.kt         ← kernel-level UID total (Layer A)
 │       ├── LogcatReporter.kt     ← optional periodic adb logcat
 │       ├── internal/
-│       │   └── TrafficAggregator.kt   ← per-domain AtomicLong counters
+│       │   ├── TrafficAggregator.kt   ← per-domain AtomicLong counters
+│       │   └── SystemTrafficReader.kt ← TrafficStats seam (testable)
 │       └── integration/
 │           ├── NetScopeInstrumented.kt  ← marker interface (anti-double-wrap)
 │           ├── NetScopeInterceptor.kt   ← OkHttp Interceptor + injector
@@ -83,7 +125,10 @@ class of bug we've already closed.
 | AOP-G6 | `NetScope.reportTx` / `reportRx` / `reportFlowEnd` are the only public-to-integration entry points into the aggregator. They short-circuit when `paused = true`. | Keeps the data path single-source-of-truth and cheap. |
 | AOP-G7 | The plugin jar MUST be Java 8 bytecode (class file major 52). HMI's Gradle 6.7.1 runs on JDK 8 and will `UnsupportedClassVersionError` on major 55 (Java 11). | Enforced by `tasks.withType(KotlinCompile) { kotlinOptions.jvmTarget = '1.8' }`. |
 | AOP-G8 | `compileOnly 'com.android.tools.build:gradle:4.2.2'` for the plugin. Any newer AGP API call (e.g. `AsmClassVisitorFactory`, `Artifacts`) will `ClassNotFoundException` on 4.2.2. | Legacy `com.android.build.api.transform.Transform` is the only portable path. |
-| AOP-G9 | When re-computing class frames in `NetScopeTransform`, override `getCommonSuperClass` to fall back to `java/lang/Object` on `ClassNotFoundException`. | Build-time ASM doesn't have the app's ClassLoader; the default impl will throw on user classes. |
+| AOP-G9 | (OBSOLETE after v2.0.2) Don't use `ClassWriter.COMPUTE_FRAMES` in `NetScopeTransform`. Use `COMPUTE_MAXS` only, and never rewrite a class that doesn't contain a target call site (see G10). | The `getCommonSuperClass` fallback used to be the workaround; G10 + G11 together remove the need. |
+| AOP-G10 | `NetScopeTransform.tryTransform()` MUST prefilter with the readonly `needsRewrite()` visitor and return `null` (= byte-for-byte passthrough) when the class contains none of our three target `INVOKEVIRTUAL`s. | v2.0.1 piped every class through `ClassReader -> ClassWriter` unconditionally, which is *not* byte-for-byte identical even when no visitor changed anything. On HMI Denali, that produced classes D8 refused with `Invalid descriptor char 'N'`. |
+| AOP-G11 | `ClassWriter` must be built with `COMPUTE_MAXS`, not `COMPUTE_FRAMES`. Our instrumenters only insert straight-line `INVOKESTATIC` + `DUP` sequences; they never add branch targets or new frame-crossing types. | `COMPUTE_FRAMES` forces ASM into `getCommonSuperClass()`, which runs `Class.forName(...)` on user classes through the plugin's classloader — those aren't visible there, wrong answers silently corrupt the StackMapTable, and D8 later trips on the dex frame table. |
+| AOP-G12 | `getTotalStats()` reads kernel-level `TrafficStats.getUid{Tx,Rx}Bytes(myUid)` minus a baseline captured at `init()`. `getDomainStats()` stays AOP-only. By design `sum(getDomainStats().tx) <= getTotalStats().txTotal`. | Historical `getTotalStats()` was `sum(AOP domains)` — invisible to native HTTP clients. v2.0.2 gives HMIs the kernel truth without us shipping a native library. |
 
 ---
 
@@ -130,9 +175,9 @@ object NetScope {
     fun status(): Status                       // NOT_INITIALIZED / ACTIVE
     fun pause(); fun resume()
     fun clearStats(); fun markIntervalBoundary()
-    fun getDomainStats(): List<DomainStats>
-    fun getIntervalStats(): List<DomainStats>
-    fun getTotalStats(): TotalStats            // sum across domains — HMI's primary
+    fun getDomainStats(): List<DomainStats>    // Layer B: AOP per domain
+    fun getIntervalStats(): List<DomainStats>  // Layer B: last interval
+    fun getTotalStats(): TotalStats            // Layer A: kernel UID total since init()
     fun setLogInterval(seconds: Int)
     fun setOnFlowEnd(cb: ((DomainStats) -> Unit)?)
     fun destroy()
@@ -179,7 +224,7 @@ HMI consumes with:
 buildscript {
   repositories { maven { url 'https://jitpack.io' } }
   dependencies {
-    classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.0'
+    classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.2'
   }
 }
 
@@ -187,7 +232,7 @@ buildscript {
 apply plugin: 'indi.arrowyi.netscope'   // AFTER AspectJ, per AOP-G4
 
 dependencies {
-  implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.0'
+  implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.2'
 }
 ```
 

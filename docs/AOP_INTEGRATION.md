@@ -47,7 +47,7 @@ buildscript {
         // Note: groupId is `com.github.Arrowyi.NetScope` (with a DOT, not a colon).
         // JitPack uses this multi-module convention because both artifacts ship
         // from the same repo.
-        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.0'
+        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.2'
     }
 }
 ```
@@ -63,13 +63,13 @@ apply plugin: 'kotlin-android'
 apply plugin: 'indi.arrowyi.netscope'
 
 dependencies {
-    implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.0'
+    implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.2'
     // OkHttp / HttpsURLConnection — already yours, NetScope uses
     // whatever version you have.
 }
 ```
 
-> **Pinning:** prefer a tag (`v2.0.0`) or an exact commit SHA. Avoid
+> **Pinning:** prefer a tag (`v2.0.2`) or an exact commit SHA. Avoid
 > `main-SNAPSHOT` in production builds — JitPack rebuilds SNAPSHOTs on
 > every fetch and will eventually version-skew.
 
@@ -87,6 +87,48 @@ class MyApplication : Application() {
 
 That's it. No code changes on your OkHttp / URL connection / WebSocket
 call sites. The plugin rewrites them at build time.
+
+### 2.4 Two-layer data model (v2.0.2+)
+
+**Layer A — Total traffic since init**: `getTotalStats()` reads
+kernel-level UID counters via `android.net.TrafficStats`, and subtracts
+a baseline snapshot captured at `init()`. Covers Java, Kotlin, C++,
+NDK, native libraries, raw sockets — whatever the kernel attributes to
+your UID. This is the "ground truth" number.
+
+**Layer B — Per-domain breakdown**: `getDomainStats()` /
+`getIntervalStats()` come from the AOP-instrumented Java call sites.
+Java-only, per-host.
+
+By construction the Layer-B sum is always ≤ the Layer-A total:
+
+```
+sum(getDomainStats().tx) <= getTotalStats().txTotal
+```
+
+The gap is non-instrumented traffic. If your app has a native HTTP
+client, that traffic appears in Layer A but not Layer B. You can
+surface the gap in your UI:
+
+```kotlin
+val total      = NetScope.getTotalStats()
+val attributed = NetScope.getDomainStats().sumOf { it.txBytesTotal + it.rxBytesTotal }
+val native     = (total.txTotal + total.rxTotal) - attributed
+```
+
+Effects of `init()` / `clearStats()` / `destroy()` on each layer:
+
+| Call | Layer A (kernel total) | Layer B (per-domain) |
+|---|---|---|
+| `init()` (first) | Captures baseline → getTotalStats starts at 0 | Clears counters |
+| `init()` (subsequent, already active) | No-op | No-op |
+| `clearStats()` | Re-captures baseline → restarts at 0 | Clears counters |
+| `destroy()` | Resets `initialized=false`; subsequent `init()` re-baselines | (Counters remain; instrumentation stays) |
+| `pause()` / `resume()` | No effect (kernel keeps counting) | Suspends / resumes increments |
+
+On pre-Q OEM kernels that return `TrafficStats.UNSUPPORTED` (-1),
+`getTotalStats()` silently falls back to the AOP sum so the UI is not
+blank.
 
 ---
 
@@ -146,27 +188,39 @@ nets / explicit documentation for Proguard-only setups.
 ## 5. Reading stats
 
 ```kotlin
-// Per domain, sorted by total bytes desc:
+// Layer B — per domain, sorted by total bytes desc (Java HTTP/S only):
 NetScope.getDomainStats().forEach { s ->
     Log.i("HMI", "${s.domain}  ↑${s.txBytesTotal}  ↓${s.rxBytesTotal}")
 }
 
-// One number for the Java side:
-val java = NetScope.getTotalStats()
-val total = java.txTotal + java.rxTotal + nativeStackTxRx()
+// Layer A — total traffic (includes Java + native + NDK):
+val total = NetScope.getTotalStats()
+Log.i("HMI", "TOTAL ↑${total.txTotal} ↓${total.rxTotal}")
 
 // Per-interval (rolling):
 NetScope.markIntervalBoundary()   // once per time tick
 val interval = NetScope.getIntervalStats()
 ```
 
-### Total traffic formula
+### Total traffic formula (v2.0.2+)
 
-> `app_total_traffic = NetScope.getTotalStats() + <native HTTP client's own stats>`
+`getTotalStats()` is now self-contained — it reads
+`android.net.TrafficStats.getUid{Tx,Rx}Bytes(myUid)` minus the baseline
+captured at `init()`. No manual summing with native-stack stats is
+needed:
 
-NetScope observes **only Java-layer** HTTP/WS. Native HTTP clients
-(Telenav `asdk.httpclient`, Chromium, NDK sockets, libcurl, …) are
-invisible to it. Those stacks report their own numbers; HMI sums.
+```
+getTotalStats()  =  all traffic the kernel counted for our UID since init()
+                 =  Java HTTP/S (Layer B) + native / C++ / NDK / raw sockets
+```
+
+If you still want to show "how much traffic came from which source",
+compute Layer-A minus the sum of Layer-B:
+
+```kotlin
+val native = total.totalBytes -
+    NetScope.getDomainStats().sumOf { it.txBytesTotal + it.rxBytesTotal }
+```
 
 ### Callbacks
 

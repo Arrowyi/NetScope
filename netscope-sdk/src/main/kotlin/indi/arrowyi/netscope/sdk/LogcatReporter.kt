@@ -52,9 +52,14 @@ internal object LogcatReporter {
             Log.i(TAG, "  %-40s ↑%-10s ↓%-10s conn=%d".format(
                 s.domain, fmtBytes(s.txBytesTotal), fmtBytes(s.rxBytesTotal), s.connCountTotal))
         }
-        Log.i(TAG, "── Total (Java stack) ────────────────────")
+        Log.i(TAG, "── Total (kernel UID, since init) ────────")
         Log.i(TAG, "  ↑%s  ↓%s  conn=%d".format(
             fmtBytes(total.txTotal), fmtBytes(total.rxTotal), total.connCountTotal))
+        val attributed = rawCumulative.sumOf { it.txBytesTotal + it.rxBytesTotal }
+        val unattributed = (total.txTotal + total.rxTotal) - attributed
+        if (unattributed > 0) {
+            Log.i(TAG, "  non-instrumented (native/NDK): %s".format(fmtBytes(unattributed)))
+        }
         Log.i(TAG, "═════════════════════════════════════════")
     }
 

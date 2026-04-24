@@ -13,6 +13,7 @@ import indi.arrowyi.netscope.plugin.instrumenter.OkHttpWebSocketInstrumenter
 import indi.arrowyi.netscope.plugin.instrumenter.UrlConnectionInstrumenter
 import org.gradle.api.logging.Logger
 import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassVisitor
 import org.objectweb.asm.ClassWriter
 import org.objectweb.asm.MethodVisitor
 import org.objectweb.asm.Opcodes
@@ -157,7 +158,7 @@ class NetScopeTransform(private val log: Logger) : Transform() {
 
     // ─── ASM pipeline ─────────────────────────────────────────────────────
 
-    private fun tryTransform(bytes: ByteArray, name: String): ByteArray? {
+    internal fun tryTransform(bytes: ByteArray, name: String): ByteArray? {
         // module-info.class and similar — skip.
         if (bytes.size < 4 || bytes[0] != 0xCA.toByte() || bytes[1] != 0xFE.toByte()) {
             return null
@@ -166,33 +167,32 @@ class NetScopeTransform(private val log: Logger) : Transform() {
         val className = reader.className
         if (shouldSkipClass(className, name)) return null
 
-        // COMPUTE_FRAMES: mandatory because our instrumenters insert
-        // instructions that reshape the operand stack mid-method. Without
-        // frame recomputation, the class file's existing stack map would
-        // be out of sync with the new bytecode and the JVM verifier would
-        // reject the class.
-        //
-        // getCommonSuperClass is overridden to return java/lang/Object on
-        // ClassNotFoundException. Rationale: at build time we don't have
-        // access to the application's own ClassLoader, so resolving
-        // arbitrary user classes to compute their superclass chain will
-        // fail; ASM's default impl then throws. Falling back to Object is
-        // safe for frame computation purposes — it's a superclass of
-        // everything, so the computed frames will be conservative but
-        // correct.
-        val writer = object : ClassWriter(reader, COMPUTE_FRAMES) {
-            override fun getCommonSuperClass(type1: String, type2: String): String {
-                return try {
-                    super.getCommonSuperClass(type1, type2)
-                } catch (_: Throwable) {
-                    "java/lang/Object"
-                }
-            }
-        }
+        // Prefilter: skip the ASM round-trip entirely for classes that do
+        // not contain any of our three target call sites. Without this,
+        // EVERY class in the build went through a ClassReader -> visitor
+        // chain -> ClassWriter cycle, which is not byte-for-byte identical
+        // to the input (ASM reorders constant pool entries, re-emits
+        // attributes etc.). In practice this exposed D8 to classes that
+        // compiled fine but could not dex after the round-trip. The
+        // prefilter takes us from ~100% of classes rewritten to just the
+        // handful that actually need it.
+        if (!needsRewrite(reader)) return null
+
+        // COMPUTE_MAXS: recompute maxStack / maxLocals only, preserve the
+        // existing StackMapTable. Safe for our three instrumenters because
+        // none of them introduce new branch targets or change the types
+        // that cross existing frame boundaries — they only insert
+        // straight-line INVOKESTATIC wrappers. Using COMPUTE_FRAMES would
+        // force ASM into getCommonSuperClass(), which tries to
+        // Class.forName() arbitrary business types via the plugin's
+        // classloader — those types aren't visible there, and a wrong
+        // answer corrupts the StackMapTable and trips D8 later
+        // ("Invalid descriptor char 'N'").
+        val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
 
         // Chain the instrumenters. Each one is a ClassVisitor that
         // delegates to the next; the tail is the writer.
-        var visitor: org.objectweb.asm.ClassVisitor = writer
+        var visitor: ClassVisitor = writer
         visitor = OkHttpWebSocketInstrumenter(Opcodes.ASM9, visitor, className, log)
         visitor = UrlConnectionInstrumenter(Opcodes.ASM9, visitor, className, log)
         visitor = OkHttpBuilderInstrumenter(Opcodes.ASM9, visitor, className, log)
@@ -203,6 +203,68 @@ class NetScopeTransform(private val log: Logger) : Transform() {
         } catch (t: Throwable) {
             log.warn("[NetScope] skip ${className}: ${t.message}")
             null
+        }
+    }
+
+    /**
+     * Readonly scan: returns true only if the class contains at least one
+     * `INVOKEVIRTUAL` to a method that one of our three instrumenters
+     * cares about. We walk with `SKIP_DEBUG | SKIP_FRAMES` and early-exit
+     * the first match (via a thrown sentinel caught here) so the worst
+     * case is a single method-body walk per class. For the common case
+     * of a class with no target calls, this is cheap.
+     */
+    private fun needsRewrite(reader: ClassReader): Boolean {
+        val detector = TargetDetector()
+        return try {
+            reader.accept(detector, ClassReader.SKIP_DEBUG or ClassReader.SKIP_FRAMES)
+            false
+        } catch (_: TargetDetector.Found) {
+            true
+        }
+    }
+
+    private class TargetDetector : ClassVisitor(Opcodes.ASM9) {
+        object Found : RuntimeException() {
+            private fun readResolve(): Any = Found
+            override fun fillInStackTrace(): Throwable = this
+        }
+
+        override fun visitMethod(
+            access: Int, name: String?, descriptor: String?,
+            signature: String?, exceptions: Array<out String>?
+        ): MethodVisitor = object : MethodVisitor(Opcodes.ASM9) {
+            override fun visitMethodInsn(
+                opcode: Int, owner: String?, methodName: String?,
+                methodDescriptor: String?, isInterface: Boolean
+            ) {
+                if (opcode == Opcodes.INVOKEVIRTUAL && isTarget(owner, methodName, methodDescriptor)) {
+                    throw Found
+                }
+            }
+        }
+
+        private fun isTarget(owner: String?, name: String?, desc: String?): Boolean {
+            if (owner == null || name == null || desc == null) return false
+            // OkHttpClient.Builder#build()Lokhttp3/OkHttpClient;
+            if (owner == "okhttp3/OkHttpClient\$Builder"
+                && name == "build"
+                && desc == "()Lokhttp3/OkHttpClient;"
+            ) return true
+            // OkHttpClient#newWebSocket(Lokhttp3/Request;Lokhttp3/WebSocketListener;)Lokhttp3/WebSocket;
+            if (owner == "okhttp3/OkHttpClient"
+                && name == "newWebSocket"
+                && desc == "(Lokhttp3/Request;Lokhttp3/WebSocketListener;)Lokhttp3/WebSocket;"
+            ) return true
+            // URLConnection / HttpURLConnection / HttpsURLConnection
+            // getInputStream()Ljava/io/InputStream; and
+            // getOutputStream()Ljava/io/OutputStream;.
+            val urlOwner = owner == "java/net/URLConnection"
+                || owner == "java/net/HttpURLConnection"
+                || owner == "javax/net/ssl/HttpsURLConnection"
+            if (urlOwner && name == "getInputStream" && desc == "()Ljava/io/InputStream;") return true
+            if (urlOwner && name == "getOutputStream" && desc == "()Ljava/io/OutputStream;") return true
+            return false
         }
     }
 

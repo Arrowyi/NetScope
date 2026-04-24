@@ -52,6 +52,11 @@ dependencies {
 
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.ow2.asm:asm-util:9.2'
+    // AGP Transform API is compileOnly for the plugin itself (so the
+    // published artifact doesn't drag AGP into the host classpath), but
+    // unit tests need it at runtime — NetScopeTransform extends
+    // com.android.build.api.transform.Transform.
+    testImplementation 'com.android.tools.build:gradle:4.2.2'
 }
 
 gradlePlugin {

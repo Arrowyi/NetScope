@@ -29,6 +29,15 @@ android {
     }
     kotlinOptions { jvmTarget = '1.8' }
 
+    testOptions {
+        // android.jar on the unit-test classpath is stubs-only and every
+        // method in every android.* class throws `RuntimeException("Stub!")`
+        // by default. For our JVM tests we need static utility calls
+        // (android.util.Log.i, TrafficStats bits) to no-op instead, so the
+        // tests can exercise pure-Kotlin logic without Robolectric.
+        unitTests.returnDefaultValues = true
+    }
+
     publishing {
         singleVariant('release') { withSourcesJar() }
     }
@@ -48,6 +57,11 @@ dependencies {
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'com.squareup.okhttp3:okhttp:4.9.3'
     testImplementation 'com.squareup.okhttp3:mockwebserver:4.9.3'
+    // Mockito for Context stubbing in NetScope init() tests. 3.12.x is
+    // the last branch compatible with our Kotlin 1.6.21 / JDK 8 test
+    // toolchain; newer Mockito requires inline-mocks + ByteBuddy newer
+    // than we can bring in here.
+    testImplementation 'org.mockito:mockito-core:3.12.4'
     androidTestImplementation 'androidx.test:runner:1.5.2'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'com.squareup.okhttp3:okhttp:4.9.3'
