@@ -19,7 +19,9 @@ internal object LogcatReporter {
         stop()
         if (intervalSeconds <= 0) return
         future = scheduler.scheduleAtFixedRate({
-            printReport()
+            runCatching { printReport() }.onFailure {
+                Log.w(TAG, "periodic report failed: ${it.message}")
+            }
         }, intervalSeconds.toLong(), intervalSeconds.toLong(), TimeUnit.SECONDS)
     }
 
@@ -29,13 +31,13 @@ internal object LogcatReporter {
     }
 
     private fun printReport() {
-        NetScopeNative.nativeMarkIntervalBoundary()
-        val rawInterval = NetScopeNative.nativeGetIntervalStats()
-        val rawCumulative = NetScopeNative.nativeGetDomainStats()
+        NetScope.markIntervalBoundary()
+        val rawInterval = NetScope.getIntervalStats()
+        val rawCumulative = NetScope.getDomainStats()
+        val total = NetScope.getTotalStats()
         val interval = rawInterval
             .filter { it.txBytesInterval + it.rxBytesInterval > 0 }
             .sortedByDescending { it.txBytesInterval + it.rxBytesInterval }
-        val cumulative = rawCumulative.sortedByDescending { it.totalBytes }
 
         val ts = dateFmt.format(Date())
         Log.d(TAG, "report raw interval=${rawInterval.size} cumulative=${rawCumulative.size}")
@@ -46,10 +48,13 @@ internal object LogcatReporter {
                 s.domain, fmtBytes(s.txBytesInterval), fmtBytes(s.rxBytesInterval), s.connCountInterval))
         }
         Log.i(TAG, "── Cumulative ────────────────────────────")
-        cumulative.forEach { s ->
+        rawCumulative.forEach { s ->
             Log.i(TAG, "  %-40s ↑%-10s ↓%-10s conn=%d".format(
                 s.domain, fmtBytes(s.txBytesTotal), fmtBytes(s.rxBytesTotal), s.connCountTotal))
         }
+        Log.i(TAG, "── Total (Java stack) ────────────────────")
+        Log.i(TAG, "  ↑%s  ↓%s  conn=%d".format(
+            fmtBytes(total.txTotal), fmtBytes(total.rxTotal), total.connCountTotal))
         Log.i(TAG, "═════════════════════════════════════════")
     }
 

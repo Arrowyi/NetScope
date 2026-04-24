@@ -11,7 +11,11 @@ import okhttp3.Request
 
 class MainActivity : AppCompatActivity() {
     private val scope = MainScope()
-    private val client = OkHttpClient()
+    // Use the Builder path so the NetScope Gradle plugin's build-time
+    // instrumentation fires on .build(). Note: `OkHttpClient()` no-arg
+    // constructor bypasses the Builder and is therefore NOT instrumented
+    // (see README "Known Limitations").
+    private val client = OkHttpClient.Builder().build()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

@@ -1,5 +1,23 @@
 # NetScope Hook Backend Evolution & Lessons Learned
 
+> **RETIRED, 2026-04-24.** NetScope no longer uses a native hook backend.
+> The conclusion from two independent devices' field evidence was that
+> even an inert SDK footprint destabilises certain host processes; see
+> the [final verdict section](#2026-04-23--final-verdict-on-b500638)
+> below and the distilled postmortem in
+> [BYTEHOOK_LESSONS.md](BYTEHOOK_LESSONS.md).
+>
+> This document is preserved verbatim as the chronological historical
+> record. `hook_manager.cpp` and the rest of `netscope-sdk/src/main/cpp/`
+> were removed in the retirement commit — references to those files are
+> therefore links into the repo's *git history*, not the working tree.
+> If you are picking the SDK up today, start at
+> [AGENT_HANDOFF.md](AGENT_HANDOFF.md).
+
+---
+
+## Original preface
+
 This document records every hooking backend NetScope has shipped, what broke,
 and what we learned. Read this **before** touching `hook_manager.cpp` or
 switching the backend again — you will very likely rediscover one of these

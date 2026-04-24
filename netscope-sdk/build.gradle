@@ -4,41 +4,23 @@ plugins {
     id 'maven-publish'
 }
 
+// NetScope is a PURE Kotlin/Java library as of 2026-04-24. The previous
+// native / bytehook hook backend was retired in favour of build-time AOP
+// instrumentation; see docs/BYTEHOOK_LESSONS.md for the postmortem. This
+// module produces an AAR with zero native libs.
+
 android {
     namespace 'indi.arrowyi.netscope.sdk'
     compileSdk 34
-    ndkVersion "25.2.9519653"
-
-    // bytehook 1.1.1 ships as a Prefab package (schema v2). AGP 7.1+ enables
-    // v2 by default; we stay on AGP 7.4.2 so no extra config is needed.
-    buildFeatures {
-        prefab true
-    }
 
     defaultConfig {
         minSdk 29
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles "consumer-rules.pro"
-
-        externalNativeBuild {
-            cmake {
-                cppFlags "-std=c++17 -fexceptions -frtti"
-                arguments "-DANDROID_STL=c++_shared"
-                abiFilters 'arm64-v8a', 'armeabi-v7a'
-            }
-        }
     }
 
     buildTypes {
         release { minifyEnabled false }
-    }
-
-    // We are a library; let the consuming app carry libbytehook.so so that
-    // we don't double-pack it into the final APK. (Per bytehook README.)
-    packagingOptions {
-        jniLibs {
-            excludes += ['**/libbytehook.so']
-        }
     }
 
     compileOptions {
@@ -47,14 +29,6 @@ android {
     }
     kotlinOptions { jvmTarget = '1.8' }
 
-    externalNativeBuild {
-        cmake {
-            path "src/main/cpp/CMakeLists.txt"
-            version "3.22.1"
-        }
-    }
-
-
     publishing {
         singleVariant('release') { withSourcesJar() }
     }
@@ -62,21 +36,31 @@ android {
 
 dependencies {
     implementation 'androidx.annotation:annotation:1.7.1'
-    // ByteDance bytehook — PLT/GOT hooker. We depend on it as `api` so the
-    // consuming app transitively pulls `libbytehook.so` via its own build;
-    // we ship nothing in our AAR's jniLibs (see packagingOptions above).
-    // See docs/HOOK_EVOLUTION.md for why we moved from xhook 1.2.0 back to
-    // bytehook and what to watch for (W^X on IVI devices).
-    api 'com.bytedance:bytehook:1.1.1'
+    // OkHttp / okio types are referenced by the optional integration helpers
+    // (NetScopeInterceptor, NetScopeWebSocket). Declared as compileOnly so
+    // host apps that do not use OkHttp are not forced to pull it in. Hosts
+    // that DO use OkHttp already have it on their classpath, so the symbols
+    // resolve at runtime.
+    // OkHttp 4.9.x was compiled with Kotlin 1.4 metadata — compatible
+    // with our Kotlin 1.6.21 toolchain. Host apps may ship a newer
+    // OkHttp; our wrappers extend stable OkHttp API that didn't change.
+    compileOnly 'com.squareup.okhttp3:okhttp:4.9.3'
     testImplementation 'junit:junit:4.13.2'
+    testImplementation 'com.squareup.okhttp3:okhttp:4.9.3'
+    testImplementation 'com.squareup.okhttp3:mockwebserver:4.9.3'
     androidTestImplementation 'androidx.test:runner:1.5.2'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
-    androidTestImplementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    androidTestImplementation 'com.squareup.okhttp3:okhttp:4.9.3'
 }
 
 publishing {
     publications {
         release(MavenPublication) {
+            // Coordinate: com.github.Arrowyi:NetScope:<version>
+            // This is HMI's documented classpath target. JitPack serves
+            // whatever artifacts our install command drops into
+            // ~/.m2/repository at the matching GAV.
+            groupId    = 'com.github.Arrowyi'
             artifactId = 'NetScope'
             version    = System.getenv('VERSION') ?: '1.0.0'
             afterEvaluate { from components.release }

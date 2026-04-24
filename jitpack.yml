@@ -3,23 +3,30 @@ jdk:
 
 # Unset JAVA_TOOL_OPTIONS before invoking Gradle.
 #
-# WHY: JitPack's build image (Oracle JDK 17 + sdkman) sets
+# WHY (historical, from the native era): JitPack's build image sets
 #   JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF-8 -Dhttps.protocols=TLSv1.2
-# which the JVM echoes to stderr as
-#   "Picked up JAVA_TOOL_OPTIONS: ..."
-# on every Java process start.
+# which the JVM echoes to stderr on every Java process start. AGP
+# 7.4.x's prefab integration treated ANY line on prefab-cli's stderr
+# as fatal, killing `configureCMakeRelWithDebInfo`.
 #
-# AGP 7.4.x's prefab integration (GeneratePrefabPackages.kt:299 in
-# `reportErrors`) treats ANY line on prefab-cli's stderr as a fatal
-# error, regardless of the subprocess exit code. The JAVA_TOOL_OPTIONS
-# echo gets captured as an IllegalStateException, and
-# configureCMakeRelWithDebInfo fails with the cryptic message
-#   > Picked up JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8 ...
-# while the CMake configure itself never actually ran.
+# NetScope no longer has native code and does not invoke prefab-cli,
+# so this is no longer strictly necessary. But `env -u JAVA_TOOL_OPTIONS`
+# is cheap insurance against any other subprocess tripping the same
+# "stderr-line = failure" pattern on JitPack's build image, so we keep
+# it. (See docs/HOOK_EVOLUTION.md and docs/BYTEHOOK_LESSONS.md for the
+# now-retired native-build story.)
 #
-# AGP 8.x filters this line out; AGP 7.4.x (what we're on) does not.
-# Until we migrate to AGP 8 the portable workaround is to remove
-# JAVA_TOOL_OPTIONS from the environment before Gradle spawns the
-# prefab-cli subprocess — `env -u VAR CMD` does exactly that.
+# Two artifacts are published:
+#   * `com.github.Arrowyi:NetScope:<tag|sha>`        — the AAR (Kotlin runtime)
+#   * `com.github.Arrowyi:NetScope-plugin:<tag|sha>` — the Gradle plugin jar
+# HMI consumes them with:
+#   classpath     'com.github.Arrowyi:NetScope-plugin:<...>'
+#   implementation 'com.github.Arrowyi:NetScope:<...>'
+#
+# The plugin is a composite build (see settings.gradle
+# `pluginManagement.includeBuild 'netscope-plugin'`), so its publish
+# task is addressed by invoking Gradle directly inside the plugin
+# directory with `-p netscope-plugin`.
 install:
   - env -u JAVA_TOOL_OPTIONS ./gradlew :netscope-sdk:publishReleasePublicationToMavenLocal
+  - env -u JAVA_TOOL_OPTIONS ./gradlew -p netscope-plugin publishReleasePublicationToMavenLocal

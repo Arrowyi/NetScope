@@ -4,6 +4,14 @@ pluginManagement {
         mavenCentral()
         gradlePluginPortal()
     }
+    // Make the sibling netscope-plugin project resolvable via the
+    // `plugins { id 'indi.arrowyi.netscope' }` DSL in other subprojects
+    // (notably `:app`). `includeBuild` turns netscope-plugin into a
+    // composite-build participant; its published plugin id resolves as
+    // if it were fetched from a remote repository. This is the standard
+    // way to consume a plugin defined alongside its consumers in the
+    // same repo.
+    includeBuild 'netscope-plugin'
 }
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
