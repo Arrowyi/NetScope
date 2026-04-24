@@ -361,6 +361,8 @@ Additionally, the initial hook install is wrapped in a thread-local `sigsetjmp` 
 
 For the full evolution of the crash scenarios we've mitigated (shadowhook W^X → bhook W^X → xhook `orig_*` crash → xhook APK-embedded misroute → bytehook 1.1.1), read [`docs/HOOK_EVOLUTION.md`](docs/HOOK_EVOLUTION.md).
 
+**Contributors / maintainers** (human or AI agent) picking up NetScope work should start at [`docs/AGENT_HANDOFF.md`](docs/AGENT_HANDOFF.md) — it is a distilled, action-oriented briefing (golden rules, playbooks, contact-surface math, commit-log landmarks) that front-loads the decisions you'll need to make.
+
 ## Known Limitations
 
 ### Environmental
