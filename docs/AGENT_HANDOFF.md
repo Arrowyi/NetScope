@@ -11,6 +11,50 @@
 
 ## Changelog
 
+### v2.0.3 (2026-04-24)
+
+One build-breaker fix consumers should know about:
+
+**Cross-scope duplicate-class dedupe (AOP-G13).** v2.0.2 declared
+`SCOPE_FULL_PROJECT` (= PROJECT + SUB_PROJECTS + EXTERNAL_LIBRARIES)
+as its **main** scope. When AGP 4.x sees `EXTERNAL_LIBRARIES` in a
+Transform's main scope, it funnels every external AAR's classes into
+a single `mixed_scope_dex_archive/` bucket and the downstream
+`DexMergingTask` then runs one merge invocation on that whole bucket.
+This collapses the per-scope dedupe that normally keeps cross-module
+same-named classes apart — on Denali, two
+`com.telenav.auto.dr.BuildConfig` (one from the local `:dr` module,
+one from a vendor `:dr` AAR with the same manifest `package`)
+suddenly collided with `D8: Type ... is defined multiple times`.
+
+The naive fix would be to drop `EXTERNAL_LIBRARIES` from the main
+scope. We considered it and rejected it: HMIs ship large vendor AARs
+(e.g. `:search`, `:map`) whose network traffic dominates their
+totals. Dropping `EXTERNAL_LIBRARIES` would mean those call sites
+never get a NetScope interceptor attached and `getDomainStats()`
+silently under-reports.
+
+v2.0.3 instead reproduces AGP's per-scope dedupe *inside* the
+Transform. We keep the full `{PROJECT, SUB_PROJECTS,
+EXTERNAL_LIBRARIES}` scope, then process inputs in
+`PROJECT > SUB_PROJECTS > EXTERNAL_LIBRARIES` order, tracking the
+internal class names we have already emitted. When a later
+lower-priority input carries a class name we have already seen, we
+drop it. This matches what AGP's baseline DexMergingTask would have
+done under scope-split routing — the higher-priority copy wins — so
+D8 no longer sees the duplicate. Vendor-AAR OkHttp / URL /
+WebSocket call sites are still rewritten.
+
+Trade-off: the Transform is now non-incremental (dedupe needs a
+fresh global seen-set every run). The hot path is still dominated
+by the v2.0.2 [needsRewrite] prefilter, so this is a few seconds
+cost on full builds, not minutes.
+
+Coordinates: `com.github.Arrowyi.NetScope:NetScope:v2.0.3` and
+`com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.3`. No API or
+runtime-semantics changes from v2.0.2 — this is a build-system-only
+fix.
+
 ### v2.0.2 (2026-04-24)
 
 Two behaviour changes consumers should know about:
@@ -129,6 +173,7 @@ class of bug we've already closed.
 | AOP-G10 | `NetScopeTransform.tryTransform()` MUST prefilter with the readonly `needsRewrite()` visitor and return `null` (= byte-for-byte passthrough) when the class contains none of our three target `INVOKEVIRTUAL`s. | v2.0.1 piped every class through `ClassReader -> ClassWriter` unconditionally, which is *not* byte-for-byte identical even when no visitor changed anything. On HMI Denali, that produced classes D8 refused with `Invalid descriptor char 'N'`. |
 | AOP-G11 | `ClassWriter` must be built with `COMPUTE_MAXS`, not `COMPUTE_FRAMES`. Our instrumenters only insert straight-line `INVOKESTATIC` + `DUP` sequences; they never add branch targets or new frame-crossing types. | `COMPUTE_FRAMES` forces ASM into `getCommonSuperClass()`, which runs `Class.forName(...)` on user classes through the plugin's classloader — those aren't visible there, wrong answers silently corrupt the StackMapTable, and D8 later trips on the dex frame table. |
 | AOP-G12 | `getTotalStats()` reads kernel-level `TrafficStats.getUid{Tx,Rx}Bytes(myUid)` minus a baseline captured at `init()`. `getDomainStats()` stays AOP-only. By design `sum(getDomainStats().tx) <= getTotalStats().txTotal`. | Historical `getTotalStats()` was `sum(AOP domains)` — invisible to native HTTP clients. v2.0.2 gives HMIs the kernel truth without us shipping a native library. |
+| AOP-G13 | `NetScopeTransform.getScopes()` is `{PROJECT, SUB_PROJECTS, EXTERNAL_LIBRARIES}` AND `transform()` implements scope-priority dedupe on class internal names (`PROJECT > SUB_PROJECTS > EXTERNAL_LIBRARIES`). The Transform is non-incremental. Never "simplify" the dedupe away or switch back to incremental. | Two opposing forces. (a) HMIs ship vendor AARs (`:search`, `:map`) with heavy HTTP — dropping EXTERNAL_LIBRARIES from scope under-reports Layer B. (b) When EXTERNAL_LIBRARIES is a main scope on AGP 4.x, all inputs collapse into `mixed_scope_dex_archive/` and AGP's default per-scope dedupe stops working, so cross-module same-named classes (e.g. two `com.foo.BuildConfig` from a local module and a vendor AAR) collide with `D8: Type ... is defined multiple times`. Doing the dedupe ourselves, in priority order, is the only way to keep both properties. Incremental builds would need a persisted seen-set which adds fragility without much win. |
 
 ---
 
@@ -224,7 +269,7 @@ HMI consumes with:
 buildscript {
   repositories { maven { url 'https://jitpack.io' } }
   dependencies {
-    classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.2'
+    classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.3'
   }
 }
 
@@ -232,7 +277,7 @@ buildscript {
 apply plugin: 'indi.arrowyi.netscope'   // AFTER AspectJ, per AOP-G4
 
 dependencies {
-  implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.2'
+  implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.3'
 }
 ```
 

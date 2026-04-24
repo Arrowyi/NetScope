@@ -126,7 +126,7 @@ buildscript {
         // groupId is `com.github.Arrowyi.NetScope` (DOT, not colon) —
         // JitPack multi-module convention because both artifacts come
         // from the same repo.
-        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.2'
+        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.3'
     }
 }
 ```
@@ -142,11 +142,11 @@ apply plugin: 'kotlin-android'
 apply plugin: 'indi.arrowyi.netscope'
 
 dependencies {
-    implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.2'
+    implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.3'
 }
 ```
 
-The `v2.0.2` tag is pinned. For other releases, pick a tag from
+The `v2.0.3` tag is pinned. For other releases, pick a tag from
 [Releases](https://github.com/Arrowyi/NetScope/releases) or an exact
 short SHA from
 [github.com/Arrowyi/NetScope/commits/main](https://github.com/Arrowyi/NetScope/commits/main).
@@ -257,13 +257,22 @@ are skipped. **Apply this plugin after AspectJ in your plugin order.**
 - **Pre-Q OEM kernels** returning `TrafficStats.UNSUPPORTED` (-1) fall
   back to reporting the AOP sum in `getTotalStats()`. Rare on devices
   shipping API 26+.
+- **Non-incremental Transform (since v2.0.3).** To allow vendor AAR
+  call sites to be instrumented without tripping the AGP 4.x
+  `mixed_scope_dex_archive` wide-scope duplicate-class collapse
+  (which bit HMI's Denali in v2.0.2), NetScope's Transform now
+  reproduces AGP's scope-priority dedupe itself. That requires a
+  fresh global seen-set each run, so the Transform opts out of
+  incremental builds. Full rebuilds cost a few seconds more; the
+  per-class bytecode prefilter from v2.0.2 keeps this minimal.
+  Vendor-AAR call sites ARE covered by `getDomainStats()`.
 
 ## Contributors / maintainers
 
 Human or AI agent picking up NetScope work should start at
 [`docs/AGENT_HANDOFF.md`](docs/AGENT_HANDOFF.md) — a distilled,
 action-oriented briefing covering the golden rules (AOP-G1 through
-AOP-G11), the playbooks for common tasks, and the publish flow. If
+AOP-G13), the playbooks for common tasks, and the publish flow. If
 someone proposes bringing the native hook backend back, first read
 [`docs/BYTEHOOK_LESSONS.md`](docs/BYTEHOOK_LESSONS.md).
 

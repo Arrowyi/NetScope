@@ -47,7 +47,7 @@ buildscript {
         // Note: groupId is `com.github.Arrowyi.NetScope` (with a DOT, not a colon).
         // JitPack uses this multi-module convention because both artifacts ship
         // from the same repo.
-        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.2'
+        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.3'
     }
 }
 ```
@@ -63,13 +63,13 @@ apply plugin: 'kotlin-android'
 apply plugin: 'indi.arrowyi.netscope'
 
 dependencies {
-    implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.2'
+    implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.3'
     // OkHttp / HttpsURLConnection — already yours, NetScope uses
     // whatever version you have.
 }
 ```
 
-> **Pinning:** prefer a tag (`v2.0.2`) or an exact commit SHA. Avoid
+> **Pinning:** prefer a tag (`v2.0.3`) or an exact commit SHA. Avoid
 > `main-SNAPSHOT` in production builds — JitPack rebuilds SNAPSHOTs on
 > every fetch and will eventually version-skew.
 
@@ -136,9 +136,17 @@ blank.
 
 | Target | Where | What the plugin emits |
 |---|---|---|
-| `okhttp3.OkHttpClient$Builder#build()` | every call site in your code and your `EXTERNAL_LIBRARIES` scope | `INVOKESTATIC NetScopeInterceptorInjector.addIfMissing(Builder)Builder` before the `build()` call |
-| `java.net.URLConnection#getInputStream()` / `#getOutputStream()` (including `HttpURLConnection`, `HttpsURLConnection`) | every call site | `INVOKESTATIC NetScopeUrlConnection.wrap{Input,Output}Stream(URLConnection, {In,Out}putStream){In,Out}putStream` wrapping the returned stream |
-| `okhttp3.OkHttpClient#newWebSocket(Request, WebSocketListener)` | every call site | wraps the `WebSocketListener` arg **and** the returned `WebSocket` for bidirectional counting |
+| `okhttp3.OkHttpClient$Builder#build()` | every call site in PROJECT + SUB_PROJECTS + EXTERNAL_LIBRARIES (vendor AARs included) | `INVOKESTATIC NetScopeInterceptorInjector.addIfMissing(Builder)Builder` before the `build()` call |
+| `java.net.URLConnection#getInputStream()` / `#getOutputStream()` (including `HttpURLConnection`, `HttpsURLConnection`) | every call site in PROJECT + SUB_PROJECTS + EXTERNAL_LIBRARIES | `INVOKESTATIC NetScopeUrlConnection.wrap{Input,Output}Stream(URLConnection, {In,Out}putStream){In,Out}putStream` wrapping the returned stream |
+| `okhttp3.OkHttpClient#newWebSocket(Request, WebSocketListener)` | every call site in PROJECT + SUB_PROJECTS + EXTERNAL_LIBRARIES | wraps the `WebSocketListener` arg **and** the returned `WebSocket` for bidirectional counting |
+
+> **v2.0.3 note on vendor AARs.** In HMI-style products it is common for
+> heavy-network modules (search, map, voice, …) to be distributed as
+> prebuilt AARs rather than as source sub-projects. v2.0.3's main
+> scope therefore includes `EXTERNAL_LIBRARIES` — call sites inside
+> these vendor AARs ARE rewritten and their traffic IS attributed to
+> the right domain via `getDomainStats()`. See §3.1 below for the
+> tiny build-side caveat this brings.
 
 **What is NOT instrumented** (by design):
 
@@ -150,6 +158,32 @@ blank.
   `dalvik/` — to avoid infinite self-rewrites and keep the runtime
   contract narrow.
 - NetScope's own packages.
+
+### 3.1 Cross-scope duplicate-class dedupe (v2.0.3+)
+
+Because the Transform's main scope now includes `EXTERNAL_LIBRARIES`,
+on AGP 4.x AGP collapses every input into a single
+`mixed_scope_dex_archive/` bucket and the downstream `DexMergingTask`
+loses the per-scope dedupe it would normally apply. If two different
+sources declare the same fully-qualified class name (typical example:
+a local sub-project `:dr` AND a prebuilt `:dr` AAR whose manifest
+carries the same `package="com.foo.dr"`, so AGP synthesises
+`com.foo.dr.BuildConfig` in both), D8 would fail with
+`Type ... is defined multiple times`.
+
+NetScope's Transform handles this by reproducing AGP's per-scope
+dedupe *inside itself*: inputs are processed in
+`PROJECT > SUB_PROJECTS > EXTERNAL_LIBRARIES` order and a later
+lower-priority input that re-declares an already-emitted class name
+is silently dropped (with a log line at `--info` level). The
+higher-priority copy wins — identical to what AGP would have done
+without NetScope in the chain. Consumers do not need to configure
+anything for this.
+
+**Side-effect:** the Transform is non-incremental (dedupe needs a
+fresh global seen-set every run). The per-class hot path is still
+dominated by the bytecode prefilter introduced in v2.0.2, so the
+additional cost on full builds is seconds, not minutes.
 
 ---
 

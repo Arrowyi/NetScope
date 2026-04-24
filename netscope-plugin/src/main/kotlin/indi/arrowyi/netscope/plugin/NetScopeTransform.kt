@@ -4,10 +4,8 @@ import com.android.build.api.transform.DirectoryInput
 import com.android.build.api.transform.Format
 import com.android.build.api.transform.JarInput
 import com.android.build.api.transform.QualifiedContent
-import com.android.build.api.transform.Status
 import com.android.build.api.transform.Transform
 import com.android.build.api.transform.TransformInvocation
-import com.android.build.gradle.internal.pipeline.TransformManager
 import indi.arrowyi.netscope.plugin.instrumenter.OkHttpBuilderInstrumenter
 import indi.arrowyi.netscope.plugin.instrumenter.OkHttpWebSocketInstrumenter
 import indi.arrowyi.netscope.plugin.instrumenter.UrlConnectionInstrumenter
@@ -29,40 +27,109 @@ import java.util.jar.JarOutputStream
  * Transform that visits every `.class` file in the project + sub-projects
  * + external library jars and applies NetScope's instrumenters.
  *
- * Incremental: honours the `incremental` flag and per-input
- * `Status`, so re-builds only touch changed files.
+ * **Scope choice (v2.0.3+):** main scope is `{PROJECT, SUB_PROJECTS,
+ * EXTERNAL_LIBRARIES}`, so OkHttp / URL / WebSocket call sites inside
+ * vendor AARs (e.g. an HMI's `:search` module shipped as a prebuilt
+ * AAR) are also rewritten and contribute to `getDomainStats()`.
  *
- * Scope choice: CLASSES content + `PROJECT | SUB_PROJECTS | EXTERNAL_LIBRARIES`
- * so an OkHttpClient created inside a vendor AAR is also instrumented.
+ * **Cross-scope duplicate-class dedupe (v2.0.3+):** there is a known
+ * AGP 4.x trap when a Transform's main scope includes
+ * `EXTERNAL_LIBRARIES`: AGP funnels every input into
+ * `mixed_scope_dex_archive/`, and the downstream `DexMergingTask`
+ * runs a single merge invocation on the whole mixed bucket. This
+ * collapses the per-scope dedupe mechanism that normally lets
+ * cross-module same-named classes (e.g. a local `:dr` module AND a
+ * vendor AAR that both declare `package="com.foo.dr"` in their
+ * manifest, so AGP synthesises `com.foo.dr.BuildConfig` twice)
+ * coexist, producing `D8: Type ... is defined multiple times`. This
+ * hit HMI's Denali in v2.0.2.
  *
- * AspectJ coexistence: `shouldSkipClass()` early-outs on any class name
- * containing `$ajc$` or ending with `$AjcClosure`. Apply this plugin
- * AFTER the AspectJ plugin in your `build.gradle`.
+ * The fix is to reproduce AGP's scope-priority dedupe *inside* the
+ * Transform: we process inputs in order `PROJECT > SUB_PROJECTS >
+ * EXTERNAL_LIBRARIES` and track internal class names we have already
+ * emitted. When a later input carries a class name we've already
+ * seen from a higher-priority scope, we drop it. This matches the
+ * behaviour AGP would have had under its default scope-split pipeline.
+ *
+ * Because dedupe relies on a global "seen classes" set built during
+ * the current invocation, this Transform is **non-incremental** (full
+ * rebuild every time). An incremental variant would require
+ * persisting the seen-set across runs and re-resolving when sources
+ * change — the complexity is not worth it for a Transform whose
+ * per-class hot path is dominated by the cheap [needsRewrite]
+ * prefilter.
+ *
+ * AspectJ coexistence: [shouldSkipClass] early-outs on any class
+ * name containing `$ajc$` or ending with `$AjcClosure`. Apply this
+ * plugin AFTER the AspectJ plugin in your `build.gradle`.
  */
 class NetScopeTransform(private val log: Logger) : Transform() {
 
     override fun getName(): String = "netscope"
 
     override fun getInputTypes(): MutableSet<QualifiedContent.ContentType> =
-        TransformManager.CONTENT_CLASS
+        mutableSetOf(QualifiedContent.DefaultContentType.CLASSES)
 
+    /**
+     * v2.0.3: the full triad `{PROJECT, SUB_PROJECTS, EXTERNAL_LIBRARIES}`,
+     * spelled out so we don't have to depend on a `TransformManager`
+     * internal constant. Cross-scope same-named classes are handled by
+     * the dedupe logic in [transform], not by restricting scope.
+     */
     override fun getScopes(): MutableSet<in QualifiedContent.Scope> =
-        TransformManager.SCOPE_FULL_PROJECT
+        mutableSetOf(
+            QualifiedContent.Scope.PROJECT,
+            QualifiedContent.Scope.SUB_PROJECTS,
+            QualifiedContent.Scope.EXTERNAL_LIBRARIES
+        )
 
-    override fun isIncremental(): Boolean = true
+    /**
+     * v2.0.3: non-incremental. Dedupe needs a global seen-set built
+     * from every input in the current invocation, which is not
+     * correct across partial builds.
+     */
+    override fun isIncremental(): Boolean = false
 
     override fun transform(invocation: TransformInvocation) {
         val outputProvider = invocation.outputProvider ?: return
-        if (!invocation.isIncremental) outputProvider.deleteAll()
+        outputProvider.deleteAll()
 
+        // Collect every input, then process in scope-priority order so
+        // that higher-priority scopes claim disputed class names first.
+        val allDirInputs = mutableListOf<DirectoryInput>()
+        val allJarInputs = mutableListOf<JarInput>()
         for (input in invocation.inputs) {
-            for (dirInput in input.directoryInputs) {
-                handleDirectoryInput(dirInput, outputProvider, invocation.isIncremental)
-            }
-            for (jarInput in input.jarInputs) {
-                handleJarInput(jarInput, outputProvider, invocation.isIncremental)
-            }
+            allDirInputs.addAll(input.directoryInputs)
+            allJarInputs.addAll(input.jarInputs)
         }
+        val sortedDirInputs = allDirInputs.sortedBy { scopePriority(it.scopes) }
+        val sortedJarInputs = allJarInputs.sortedBy { scopePriority(it.scopes) }
+
+        // `seenClasses` holds every internal class name we have already
+        // emitted to any output in this invocation. A later input whose
+        // entry collides (same internal name) is dropped — the
+        // higher-priority scope already wrote its copy.
+        val seenClasses = HashSet<String>()
+
+        for (dirInput in sortedDirInputs) {
+            handleDirectoryInput(dirInput, outputProvider, seenClasses)
+        }
+        for (jarInput in sortedJarInputs) {
+            handleJarInput(jarInput, outputProvider, seenClasses)
+        }
+    }
+
+    /**
+     * Scope priority used for cross-scope duplicate-class dedupe.
+     * Lower number = higher priority (claims the name first). This
+     * mirrors AGP's baseline DexMergingTask behaviour: local code
+     * wins over sub-project jars, which win over external libraries.
+     */
+    internal fun scopePriority(scopes: Set<*>): Int = when {
+        scopes.contains(QualifiedContent.Scope.PROJECT) -> 0
+        scopes.contains(QualifiedContent.Scope.SUB_PROJECTS) -> 1
+        scopes.contains(QualifiedContent.Scope.EXTERNAL_LIBRARIES) -> 2
+        else -> 3
     }
 
     // ─── Directory inputs (module class output) ───────────────────────────
@@ -70,49 +137,37 @@ class NetScopeTransform(private val log: Logger) : Transform() {
     private fun handleDirectoryInput(
         dirInput: DirectoryInput,
         outputProvider: com.android.build.api.transform.TransformOutputProvider,
-        incremental: Boolean
+        seenClasses: MutableSet<String>
     ) {
         val dest: File = outputProvider.getContentLocation(
             dirInput.name, dirInput.contentTypes, dirInput.scopes, Format.DIRECTORY
         )
-        if (incremental) {
-            val changed = dirInput.changedFiles
-            if (changed.isEmpty()) return
-            for ((file, status) in changed) {
-                val relative = dirInput.file.toPath().relativize(file.toPath()).toString()
-                val outFile = File(dest, relative)
-                when (status) {
-                    Status.NOTCHANGED -> {}
-                    Status.REMOVED -> outFile.delete()
-                    Status.ADDED, Status.CHANGED -> {
-                        outFile.parentFile?.mkdirs()
-                        writeTransformed(file, outFile)
-                    }
-                    else -> {}
-                }
-            }
-        } else {
-            copyAndTransformDir(dirInput.file, dest)
+        if (!dirInput.file.isDirectory) return
+        dirInput.file.walkTopDown().filter { it.isFile }.forEach { file ->
+            val relative = dirInput.file.toPath().relativize(file.toPath()).toString()
+            val outFile = File(dest, relative)
+            writeTransformedWithDedupe(file, outFile, seenClasses)
         }
     }
 
-    private fun copyAndTransformDir(src: File, dst: File) {
-        if (!src.isDirectory) return
-        src.walkTopDown().filter { it.isFile }.forEach { file ->
-            val relative = src.toPath().relativize(file.toPath()).toString()
-            val outFile = File(dst, relative)
-            outFile.parentFile?.mkdirs()
-            writeTransformed(file, outFile)
-        }
-    }
-
-    private fun writeTransformed(input: File, output: File) {
+    private fun writeTransformedWithDedupe(
+        input: File,
+        output: File,
+        seenClasses: MutableSet<String>
+    ) {
         if (!input.name.endsWith(".class")) {
+            output.parentFile?.mkdirs()
             input.copyTo(output, overwrite = true)
             return
         }
         val bytes = FileInputStream(input).use { it.readBytes() }
+        val internalName = readInternalName(bytes)
+        if (internalName != null && !seenClasses.add(internalName)) {
+            log.info("[NetScope] dedupe: skip duplicate class {} (dir input {})", internalName, input)
+            return
+        }
         val transformed = tryTransform(bytes, input.name) ?: bytes
+        output.parentFile?.mkdirs()
         FileOutputStream(output).use { it.write(transformed) }
     }
 
@@ -121,39 +176,71 @@ class NetScopeTransform(private val log: Logger) : Transform() {
     private fun handleJarInput(
         jarInput: JarInput,
         outputProvider: com.android.build.api.transform.TransformOutputProvider,
-        incremental: Boolean
+        seenClasses: MutableSet<String>
     ) {
         val dest: File = outputProvider.getContentLocation(
             jarInput.name, jarInput.contentTypes, jarInput.scopes, Format.JAR
         )
-        if (incremental) {
-            when (jarInput.status) {
-                Status.NOTCHANGED -> return
-                Status.REMOVED -> { dest.delete(); return }
-                else -> {}
-            }
-        }
-        transformJar(jarInput.file, dest)
+        transformJarWithDedupe(jarInput.file, dest, seenClasses)
     }
 
-    private fun transformJar(inputJar: File, outputJar: File) {
+    /**
+     * Copy `inputJar` to `outputJar`, rewriting class bytes via
+     * [tryTransform] and **skipping** any class entry whose internal
+     * name is already present in [seenClasses]. Non-class entries are
+     * copied as-is. Duplicate-class skip-writes are logged at `info`
+     * level for diagnostics.
+     *
+     * Internal visibility so unit tests can exercise the dedupe path
+     * without spinning up a full `TransformInvocation`.
+     */
+    internal fun transformJarWithDedupe(
+        inputJar: File,
+        outputJar: File,
+        seenClasses: MutableSet<String>
+    ) {
         outputJar.parentFile?.mkdirs()
         JarInputStream(FileInputStream(inputJar)).use { jin ->
             JarOutputStream(FileOutputStream(outputJar)).use { jout ->
                 var entry: JarEntry? = jin.nextJarEntry
                 while (entry != null) {
                     val name = entry.name
-                    jout.putNextEntry(JarEntry(name))
                     val body = jin.readBytes()
-                    val outBytes = if (name.endsWith(".class")) {
-                        tryTransform(body, name) ?: body
-                    } else body
-                    jout.write(outBytes)
-                    jout.closeEntry()
+
+                    if (name.endsWith(".class")) {
+                        val internalName = readInternalName(body)
+                        if (internalName != null && !seenClasses.add(internalName)) {
+                            log.info(
+                                "[NetScope] dedupe: skip duplicate class {} (jar {})",
+                                internalName, inputJar
+                            )
+                            entry = jin.nextJarEntry
+                            continue
+                        }
+                        val outBytes = tryTransform(body, name) ?: body
+                        jout.putNextEntry(JarEntry(name))
+                        jout.write(outBytes)
+                        jout.closeEntry()
+                    } else {
+                        jout.putNextEntry(JarEntry(name))
+                        jout.write(body)
+                        jout.closeEntry()
+                    }
                     entry = jin.nextJarEntry
                 }
             }
         }
+    }
+
+    /**
+     * Read a class file's internal name cheaply via `ClassReader`.
+     * Returns `null` for non-class byte streams (e.g. short headers,
+     * corrupt entries) — the caller treats `null` as "not a class we
+     * can dedupe on" and keeps the entry.
+     */
+    private fun readInternalName(bytes: ByteArray): String? {
+        if (bytes.size < 4 || bytes[0] != 0xCA.toByte() || bytes[1] != 0xFE.toByte()) return null
+        return try { ClassReader(bytes).className } catch (_: Throwable) { null }
     }
 
     // ─── ASM pipeline ─────────────────────────────────────────────────────
