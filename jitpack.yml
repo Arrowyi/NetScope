@@ -16,12 +16,14 @@ jdk:
 # it. (See docs/HOOK_EVOLUTION.md and docs/BYTEHOOK_LESSONS.md for the
 # now-retired native-build story.)
 #
-# Two artifacts are published:
-#   * `com.github.Arrowyi:NetScope:<tag|sha>`        — the AAR (Kotlin runtime)
-#   * `com.github.Arrowyi:NetScope-plugin:<tag|sha>` — the Gradle plugin jar
+# Two artifacts are published. Because JitPack sees two modules in a
+# single repo, it serves them under its *multi-module* coordinate scheme
+# (groupId = com.github.<owner>.<repo>, note the dot):
+#   * `com.github.Arrowyi.NetScope:NetScope:<tag|sha>`        — the AAR (Kotlin runtime)
+#   * `com.github.Arrowyi.NetScope:NetScope-plugin:<tag|sha>` — the Gradle plugin jar
 # HMI consumes them with:
-#   classpath     'com.github.Arrowyi:NetScope-plugin:<...>'
-#   implementation 'com.github.Arrowyi:NetScope:<...>'
+#   classpath      'com.github.Arrowyi.NetScope:NetScope-plugin:<...>'
+#   implementation 'com.github.Arrowyi.NetScope:NetScope:<...>'
 #
 # The plugin is a composite build (see settings.gradle
 # `pluginManagement.includeBuild 'netscope-plugin'`), so its publish

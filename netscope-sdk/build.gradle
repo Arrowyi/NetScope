@@ -56,10 +56,10 @@ dependencies {
 publishing {
     publications {
         release(MavenPublication) {
-            // Coordinate: com.github.Arrowyi:NetScope:<version>
-            // This is HMI's documented classpath target. JitPack serves
-            // whatever artifacts our install command drops into
-            // ~/.m2/repository at the matching GAV.
+            // Local/maven-local coordinate. JitPack republishes this as
+            //   com.github.Arrowyi.NetScope:NetScope:<tag>
+            // (multi-module convention because both the SDK and the
+            // Gradle plugin ship from the same repo).
             groupId    = 'com.github.Arrowyi'
             artifactId = 'NetScope'
             version    = System.getenv('VERSION') ?: '1.0.0'

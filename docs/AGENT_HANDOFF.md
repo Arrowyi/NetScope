@@ -167,10 +167,10 @@ javap -c -p app/build/intermediates/transforms/netscope/debug/*/*/indi/arrowyi/n
     | grep NetScopeInterceptorInjector
 ```
 
-**Publishing**: JitPack watches `main`. On each push it builds:
+**Publishing**: JitPack watches tags + `main`. One build produces both artifacts. Because we publish two modules from a single repo, JitPack uses the **multi-module coordinate scheme** — the groupId is `com.github.Arrowyi.NetScope` (note the dot):
 
-- `com.github.Arrowyi:NetScope:<sha>` — the AAR
-- `com.github.Arrowyi:NetScope-plugin:<sha>` — the Gradle plugin jar
+- `com.github.Arrowyi.NetScope:NetScope:<tag-or-sha>` — the AAR
+- `com.github.Arrowyi.NetScope:NetScope-plugin:<tag-or-sha>` — the Gradle plugin jar
 
 HMI consumes with:
 
@@ -179,7 +179,7 @@ HMI consumes with:
 buildscript {
   repositories { maven { url 'https://jitpack.io' } }
   dependencies {
-    classpath 'com.github.Arrowyi:NetScope-plugin:<sha-or-tag>'
+    classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.0'
   }
 }
 
@@ -187,9 +187,13 @@ buildscript {
 apply plugin: 'indi.arrowyi.netscope'   // AFTER AspectJ, per AOP-G4
 
 dependencies {
-  implementation 'com.github.Arrowyi:NetScope:<sha-or-tag>'
+  implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.0'
 }
 ```
+
+> Don't be tempted to rewrite the groupId to `com.github.Arrowyi` (single-colon form).
+> That form would require splitting the plugin into its own GitHub repo. The
+> multi-module form keeps both artifacts in one repo and one build log.
 
 ---
 

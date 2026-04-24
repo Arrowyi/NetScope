@@ -66,11 +66,12 @@ gradlePlugin {
 publishing {
     publications {
         release(MavenPublication) {
+            // Publish coordinate for local/maven-local testing. On JitPack
+            // this gets republished at com.github.Arrowyi.NetScope:NetScope-plugin
+            // (the multi-module convention), because this repo produces
+            // more than one artifact. HMI's classpath:
+            //   classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.0'
             groupId    = 'com.github.Arrowyi'
-            // Match HMI's documented coordinate exactly:
-            //   classpath 'com.github.Arrowyi.NetScope-plugin:X.Y.Z'
-            // JitPack maps GitHub group/NetScope -> com.github.Arrowyi; the
-            // artifactId below produces the `NetScope-plugin` leaf.
             artifactId = 'NetScope-plugin'
             version    = System.getenv('VERSION') ?: '1.0.0'
             from components.java

@@ -96,7 +96,10 @@ buildscript {
         maven { url 'https://jitpack.io' }
     }
     dependencies {
-        classpath 'com.github.Arrowyi:NetScope-plugin:<latest-commit>'
+        // groupId is `com.github.Arrowyi.NetScope` (DOT, not colon) —
+        // JitPack multi-module convention because both artifacts come
+        // from the same repo.
+        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.0'
     }
 }
 ```
@@ -112,13 +115,16 @@ apply plugin: 'kotlin-android'
 apply plugin: 'indi.arrowyi.netscope'
 
 dependencies {
-    implementation 'com.github.Arrowyi:NetScope:<latest-commit>'
+    implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.0'
 }
 ```
 
-Replace `<latest-commit>` with a short SHA from
-[github.com/Arrowyi/NetScope/commits/main](https://github.com/Arrowyi/NetScope/commits/main)
-or a tag from [Releases](https://github.com/Arrowyi/NetScope/releases).
+The `v2.0.0` tag is pinned. For other releases, pick a tag from
+[Releases](https://github.com/Arrowyi/NetScope/releases) or an exact
+short SHA from
+[github.com/Arrowyi/NetScope/commits/main](https://github.com/Arrowyi/NetScope/commits/main).
+Avoid `main-SNAPSHOT` in production — JitPack re-resolves it on every
+fetch.
 
 ### Step 3 — Initialise in `Application.onCreate()`
 

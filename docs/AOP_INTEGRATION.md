@@ -44,7 +44,10 @@ buildscript {
         maven { url 'https://jitpack.io' }   // already in Denali
     }
     dependencies {
-        classpath 'com.github.Arrowyi:NetScope-plugin:<tag-or-sha>'
+        // Note: groupId is `com.github.Arrowyi.NetScope` (with a DOT, not a colon).
+        // JitPack uses this multi-module convention because both artifacts ship
+        // from the same repo.
+        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v2.0.0'
     }
 }
 ```
@@ -60,11 +63,15 @@ apply plugin: 'kotlin-android'
 apply plugin: 'indi.arrowyi.netscope'
 
 dependencies {
-    implementation 'com.github.Arrowyi:NetScope:<tag-or-sha>'
+    implementation 'com.github.Arrowyi.NetScope:NetScope:v2.0.0'
     // OkHttp / HttpsURLConnection — already yours, NetScope uses
     // whatever version you have.
 }
 ```
+
+> **Pinning:** prefer a tag (`v2.0.0`) or an exact commit SHA. Avoid
+> `main-SNAPSHOT` in production builds — JitPack rebuilds SNAPSHOTs on
+> every fetch and will eventually version-skew.
 
 ### 2.3 Initialise once
 
