@@ -12,9 +12,10 @@ A lightweight Android SDK that reports:
   app.
 - **Layer B — Per-API (host + path) Java-layer breakdown** via
   build-time AOP instrumentation of `OkHttpClient.Builder.build()`,
-  `HttpsURLConnection`, and `OkHttpClient.newWebSocket(...)`. v3.0.0+:
-  API granularity (`api.example.com/v1/users/:id`) replaces the old
-  domain-only granularity — see [Migrating from v2 → v3](#migrating-from-v2--v3).
+  `HttpsURLConnection`, and `OkHttpClient.newWebSocket(...)`.
+  API granularity (`api.example.com/v1/users/:id`) — numeric IDs,
+  UUIDs, and long hex segments are templated so traffic for the same
+  endpoint shape aggregates into one row.
 
 Zero source-code changes to the host app. Works on phones, tablets,
 and **Android Automotive** / OEM car head-units where `VpnService` /
@@ -64,7 +65,9 @@ so native / non-instrumented traffic is not missing.
 `getApiStats()` is "since `init()`, AOP-observed Java HTTP/S, one
 entry per (host, path)". The **gap** between them is non-instrumented
 traffic — native HTTP clients, NDK / C++ code, libcurl, raw
-`java.net.Socket`, signed binary blobs. By construction:
+`java.net.Socket`, signed binary blobs, plus anything emitted from a
+class the Transform skips (see [What gets instrumented](#what-gets-instrumented)).
+By construction:
 
 ```
 sum(getApiStats().tx) <= getTotalStats().txTotal
@@ -76,10 +79,10 @@ explicitly:
 ```kotlin
 val total      = NetScope.getTotalStats()
 val attributed = NetScope.getApiStats().sumOf { it.txBytesTotal + it.rxBytesTotal }
-val native     = total.totalBytes - attributed   // native / non-instrumented
+val unattributed = total.totalBytes - attributed   // native + non-instrumented Java
 ```
 
-### API key shape (v3.0.0+)
+### API key shape
 
 Each `ApiStats` has two string fields and a derived `key = "$host$path"`:
 
@@ -101,7 +104,7 @@ the same `api.example.com` on two different ports splits into two API
 entries, which matches what the kernel / network actually treats them
 as.
 
-### Which URLs get counted (v3.0.1+)
+### Which URLs get counted
 
 The Gradle Transform rewrites *every* `URLConnection.getInputStream()`
 / `getOutputStream()` call site in the app. At runtime NetScope
@@ -117,25 +120,20 @@ classifies the connection's URL before wrapping:
 | `asset:`, `android.resource:`, `res:`, `data:` | no | local |
 | `jar:file:/…!/entry` | no | inner URL is local |
 
-Rule (**AOP-G16**): local-scheme *denylist* rather than http(s)
-*allowlist*. If a new over-the-wire transport appears (say `quic:`),
-it will be counted by default — the denylist bias is deliberately
-conservative about missing traffic and liberal about counting it.
-
-This is the fix for the common "my total bytes include the app
-reading its own assets" complaint — those reads never showed up in
-`getTotalStats()` (the kernel doesn't count local FS reads as
-network), but they used to leak into `getApiStats()` under an
-`<unknown>/…` row.
+The classifier uses a local-scheme **denylist** rather than an
+http(s) **allowlist**. If a new over-the-wire transport appears
+(say `quic:`), it will be counted by default — the denylist bias is
+deliberately conservative about missing traffic and liberal about
+counting it. Local-filesystem reads via `URLConnection` therefore
+never leak into `getApiStats()` under an `<unknown>/…` row.
 
 ### Why this architecture
 
-The previous native-hook implementation (bytehook / shadowhook) is
-retired — see [`docs/BYTEHOOK_LESSONS.md`](docs/BYTEHOOK_LESSONS.md)
-for the postmortem. Two OEM devices (HONOR AGM3-W09HN, Chery 8155)
-proved that even an inert native SDK footprint destabilises certain
-host processes. AOP + `TrafficStats` together give us "total traffic
-including native" **without** shipping any native library.
+AOP + `TrafficStats` together give you "total traffic including
+native" **without** shipping any native library. The Java layer is
+visible per-API; the kernel layer fills in everything else (NDK,
+WebView, raw sockets, prebuilt binaries). No `VpnService`, no root,
+no native hook — works on locked-down OEM devices.
 
 ### No double counting, no missed flows
 
@@ -197,16 +195,11 @@ dependencies {
 }
 ```
 
-The `v3.0.1` tag is pinned. **v3.0.0 was a breaking change** (see
-[Migrating from v2 → v3](#migrating-from-v2--v3)); v3.0.1 tightens
-the URL scheme policy so local-filesystem reads aren't counted as
-network traffic (AOP-G16). No source-level migration needed from
-v3.0.0. For other releases, pick a tag from
+For a production build, pin to a tag from
 [Releases](https://github.com/Arrowyi/NetScope/releases) or an exact
 short SHA from
 [github.com/Arrowyi/NetScope/commits/main](https://github.com/Arrowyi/NetScope/commits/main).
-Avoid `main-SNAPSHOT` in production — JitPack re-resolves it on every
-fetch.
+Avoid `main-SNAPSHOT` — JitPack re-resolves it on every fetch.
 
 ### Step 3 — Initialise in `Application.onCreate()`
 
@@ -232,10 +225,10 @@ connections, and WebSockets are instrumented at build time.
 
 | Method | Description |
 |--------|-------------|
-| `init(context): Status` | Idempotent. Clears per-domain counters and captures a `TrafficStats` baseline so numbers are "since `init()`". Always returns `ACTIVE`. |
+| `init(context): Status` | Idempotent. Clears per-API counters and captures a `TrafficStats` baseline so numbers are "since `init()`". Always returns `ACTIVE`. |
 | `status(): Status` | Current state: `NOT_INITIALIZED` or `ACTIVE`. |
-| `pause()` / `resume()` | Suspend / resume **per-domain** counting. Affects Layer B only — `getTotalStats()` (Layer A / kernel) keeps counting. |
-| `clearStats()` | Reset per-domain counters AND re-capture kernel baseline, so both layers restart from 0. |
+| `pause()` / `resume()` | Suspend / resume **per-API** counting. Affects Layer B only — `getTotalStats()` (Layer A / kernel) keeps counting. |
+| `clearStats()` | Reset per-API counters AND re-capture kernel baseline, so both layers restart from 0. |
 | `markIntervalBoundary()` | Freeze current-interval counters into the interval snapshot; start a new interval. |
 | `getApiStats(): List<ApiStats>` | **Layer B.** AOP per-API (host + path) cumulative since `init()` / last `clearStats()`. Java-only. Sorted by total bytes desc. |
 | `getIntervalStats(): List<ApiStats>` | Last completed interval's per-API stats. |
@@ -244,7 +237,7 @@ connections, and WebSockets are instrumented at build time.
 | `setOnFlowEnd(cb?)` | Register per-flow-close callback. Pass `null` to clear. |
 | `destroy()` | Stop the reporter and clear state. Instrumentation stays in the bytecode; rebuild without the plugin to fully remove. |
 
-### `ApiStats` (data class, v3.0.0+)
+### `ApiStats` (data class)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -291,10 +284,72 @@ I NetScope: ══════════════════════�
 | `URLConnection.getInputStream()` / `getOutputStream()` (including `HttpURLConnection` / `HttpsURLConnection`) | Return value wrapped in a counting `FilterInputStream` / `FilterOutputStream`. |
 | `OkHttpClient.newWebSocket(Request, WebSocketListener)` | Listener wrapped to count inbound frames; returned `WebSocket` wrapped to count outbound `send(...)`. |
 
-Classes in `okhttp3/`, `okio/`, `java/`, `javax/`, `android/`,
-`androidx/`, `kotlin*/`, `com/android/`, `com/google/android/`,
-`dalvik/` are skipped. AspectJ-synthesised classes (`$ajc$` / `$AjcClosure`)
-are skipped. **Apply this plugin after AspectJ in your plugin order.**
+### Classes the Transform skips (call-site rewrite only)
+
+The Transform does not rewrite call sites that live inside the
+following packages:
+
+| Skipped prefix | Why it must be skipped |
+|---|---|
+| `okhttp3/`, `okio/` | OkHttp internally constructs `OkHttpClient` (redirect handlers, `Dispatcher`, etc.); rewriting these call sites would cause `NetScopeInterceptor` to be re-applied on top of itself. |
+| `java/`, `javax/`, `android/`, `androidx/`, `com/android/`, `com/google/android/`, `dalvik/` | Boot classpath + Android framework + AndroidX + GMS. These classes are loaded from the platform / shared classloaders and any rewrites we ship are not actually used at runtime. |
+| `kotlin/`, `kotlinx/` | Kotlin stdlib — same reason as above. |
+| `$ajc$`, `$AjcClosure` | AspectJ-synthesised classes. Leaving them alone keeps AspectJ weaving correct. |
+| `indi/arrowyi/netscope/...` | NetScope's own runtime, to prevent self-loops. |
+
+> **This is a *call-site* skip, not a *traffic* skip.** Bytes that flow
+> through these classes still count in `getTotalStats()` (kernel
+> `TrafficStats`). They simply do not appear in `getApiStats()`'s
+> per-API breakdown and surface as part of the `total - sum(apis)`
+> gap.
+
+#### Per-API blind spots this creates
+
+`getApiStats()` is computed at the *caller* side of three OkHttp /
+URLConnection methods. If the caller class lives under a skipped
+prefix, that flow is invisible to the per-API breakdown. The
+following are the realistic cases to be aware of:
+
+| Source | Skipped prefix that hides it | What you lose from `getApiStats()` |
+|---|---|---|
+| Google Play Services / Firebase / FCM / Maps / Crashlytics / Auth | `com/google/android/` (`com.google.android.gms.*`, `com.google.android.libraries.*`) | All GMS-internal HTTP — token refresh, push long-poll, map tiles, crash uploads. |
+| AndroidX Media3 / ExoPlayer streaming | `androidx/` (`androidx.media3.*`) | Streaming media DataSource traffic — usually the largest single contributor on car / video apps. |
+| AndroidX WorkManager constraint pings, AndroidX Browser custom tabs | `androidx/` | Background HTTP for scheduled work, custom-tab prefetch. |
+| Android framework HTTP (DownloadManager, sync adapters, some WebView fallbacks) | `android/`, `com/android/` | Java-side downloads / sync. WebView itself is mostly native and outside Layer B regardless. |
+| Vendor / OEM AAR whose package is `com.android.*` or `com.google.android.*` | `com/android/`, `com/google/android/` | Whatever HTTP that AAR makes. Common on automotive / HMI projects integrating prebuilt AARs. |
+| Business code accidentally obfuscated into `androidx.*` / `com.android.*` by ProGuard rules | matches the prefix | Same as a vendor AAR — looks like the plugin "stopped working" in release. |
+| Network calls woven by AspectJ into `$AjcClosure` synthetic classes | `$AjcClosure` | The original call site moves into a synthetic class that NetScope leaves alone. |
+
+In every case above the **traffic itself is still counted by
+`getTotalStats()`** and surfaces inside the `total - sum(apis)`
+difference. The HMI / dashboard label "non-instrumented (native/NDK)"
+in the logcat sample is therefore a slight under-spec — that bucket
+contains *both* genuine native traffic *and* Java traffic from the
+skipped packages above. Treat it as "unattributed" rather than
+"native".
+
+#### Mitigations
+
+- **Pin the plugin order.** Always apply `indi.arrowyi.netscope`
+  *after* AspectJ. Reversing the order leaves AspectJ trying to weave
+  over already-rewritten call sites and can fail at compile time.
+- **Always render the gap.** UI / telemetry that surfaces per-API
+  bytes should also surface `total - sum(apis)` as an "unattributed"
+  row, not silently drop it.
+- **Audit vendor AAR packages.** If integrating a prebuilt AAR whose
+  package falls under `com/android/` or `com/google/android/`, expect
+  it to be invisible to `getApiStats()`. If you need per-API
+  visibility for it, repackage / consider lifting that prefix from
+  the skip list (and re-test `Interceptor` chain compatibility — see
+  next bullet).
+- **Lifting a skip prefix is possible but risky.** For projects that
+  must split GMS / ExoPlayer per-endpoint, the skip list in
+  `NetScopeTransform.kt` can be relaxed for specific prefixes.
+  Validate carefully: those libraries internally construct
+  `OkHttpClient`s used as building blocks (e.g. ExoPlayer's
+  `OkHttpDataSource.Factory`), and adding `NetScopeInterceptor` into
+  every one of them may interact with their own interceptor chains.
+  Roll out behind a build flag and verify on a real device.
 
 ## Known Limitations
 
@@ -303,109 +358,46 @@ are skipped. **Apply this plugin after AspectJ in your plugin order.**
   counted in `getTotalStats()` (kernel-level). Prefer
   `OkHttpClient.Builder().build()` if you want the per-API breakdown.
 - **Reflection-constructed HTTP clients** are not instrumented — per-
-  API stats will miss them. Again, `getTotalStats()` still includes
-  their traffic.
+  API stats will miss them. `getTotalStats()` still includes their
+  traffic.
 - **Native HTTP clients** (NDK code, WebView / Chromium, libcurl via
   JNI) show up in `getTotalStats()` but not `getApiStats()`. Compute
   `total - sum(apis)` to surface this gap.
 - **`java.net.Socket` direct use** is not per-API-instrumented but is
   counted in the kernel total.
+- **Third-party libraries whose call sites live under skipped
+  packages** (GMS, Firebase, AndroidX Media3 / ExoPlayer, vendor AARs
+  shipped under `com.android.*` / `com.google.android.*`, AspectJ
+  `$AjcClosure`-woven calls) are absent from `getApiStats()`. Their
+  traffic is still counted in `getTotalStats()` and surfaces in the
+  `total - sum(apis)` gap. See
+  [Per-API blind spots this creates](#per-api-blind-spots-this-creates)
+  for the full list and mitigations.
 - **Path templating is heuristic.** `:id`/`:uuid`/`:hash` are applied
   per segment based on regex, so `/articles/some-natural-slug` stays
   literal (desired) but a numeric slug like `/articles/2026` collapses
-  to `/articles/:id` (may be too aggressive for editorial APIs). The
-  v3.0.0 rules are intentionally conservative; a pluggable normalizer
-  is on the roadmap if host apps need custom rules.
-- **`pause()`** suspends Layer B (per-domain) counting but does NOT
+  to `/articles/:id` (may be too aggressive for editorial APIs). A
+  pluggable normaliser is on the roadmap if host apps need custom
+  rules.
+- **`pause()`** suspends Layer B (per-API) counting but does NOT
   suspend Layer A (kernel total). The kernel keeps counting regardless
   of SDK state.
 - **Pre-Q OEM kernels** returning `TrafficStats.UNSUPPORTED` (-1) fall
   back to reporting the AOP sum in `getTotalStats()`. Rare on devices
   shipping API 26+.
-- **Non-incremental Transform (since v2.0.3).** To allow vendor AAR
-  call sites to be instrumented without tripping the AGP 4.x
-  `mixed_scope_dex_archive` wide-scope duplicate-class collapse
-  (which bit HMI's Denali in v2.0.2), NetScope's Transform now
-  reproduces AGP's scope-priority dedupe itself. That requires a
-  fresh global seen-set each run, so the Transform opts out of
-  incremental builds. Full rebuilds cost a few seconds more; the
-  per-class bytecode prefilter from v2.0.2 keeps this minimal.
-  Vendor-AAR call sites ARE covered by `getApiStats()`.
-
-## Migrating from v2 → v3
-
-v3.0.0 is a **breaking release**. One new concept (API granularity),
-four renamed symbols, no behaviour change for `getTotalStats()`.
-
-### At a glance
-
-| v2.x | v3.0.0 | Notes |
-|---|---|---|
-| `DomainStats` | `ApiStats` | New fields: `host`, `path`, `key`. `domain` removed. |
-| `NetScope.getDomainStats()` | `NetScope.getApiStats()` | Returns `List<ApiStats>`. |
-| `NetScope.getIntervalStats()` returning `DomainStats` | Same name, now returns `List<ApiStats>` | Signature change only. |
-| `NetScope.setOnFlowEnd((DomainStats) -> Unit)` | `NetScope.setOnFlowEnd((ApiStats) -> Unit)` | |
-| `stats.domain` | `stats.host` + `stats.path` or `stats.key` | Depending on whether you want the raw host or a pretty `host/path` string. |
-
-### Code migration — before / after
-
-Before (v2.x):
-
-```kotlin
-NetScope.setOnFlowEnd { s ->
-    Log.d("Net", "${s.domain} ↑${s.txBytesInterval} ↓${s.rxBytesInterval}")
-}
-NetScope.getDomainStats().forEach { render(it.domain, it.totalBytes) }
-```
-
-After (v3.0.0):
-
-```kotlin
-NetScope.setOnFlowEnd { s ->
-    Log.d("Net", "${s.key} ↑${s.txBytesInterval} ↓${s.rxBytesInterval}")
-}
-NetScope.getApiStats().forEach { render(it.key, it.totalBytes) }
-
-// If your HMI's existing UI still groups by host, fold on `host`:
-NetScope.getApiStats()
-    .groupBy { it.host }
-    .mapValues { (_, rows) -> rows.sumOf { it.totalBytes } }
-```
-
-### Why we broke the API
-
-Host-level aggregation (`api.example.com` = one row) is too coarse
-for HMIs that care which endpoint is expensive. v3.0.0 splits every
-`(host, path)` into its own row so an auto-telematics app can tell
-`/v1/location` (chatty, small payloads) apart from `/v1/map-tiles`
-(infrequent, big payloads) even when they share `api.example.com`.
-
-Adding a parallel `getApiStats()` alongside the old `getDomainStats()`
-would have doubled the aggregator's memory footprint. For an SDK that
-must run on constrained OEM head-units, that was not worth the
-source-compat savings.
-
-### Upgrade checklist
-
-- [ ] Replace every `DomainStats` reference with `ApiStats`.
-- [ ] Replace every `getDomainStats()` call with `getApiStats()`.
-- [ ] Replace every `stats.domain` access with `stats.key` (or
-      `stats.host` + `stats.path` if you want to render them separately).
-- [ ] If your UI grouped rows by host, add `.groupBy { it.host }` at
-      the presentation layer.
-- [ ] Rebuild — the Gradle plugin `v3.0.0` is required to emit
-      bytecode matching the new 3-arg `wrapListener` / `wrapWebSocket`
-      helpers. Mixing v2.x plugin with v3.x SDK (or vice versa) will
-      fail at link time with `NoSuchMethodError`.
-
-## Contributors / maintainers
-
-Human or AI agent picking up NetScope work should start at
-[`docs/AGENT_HANDOFF.md`](docs/AGENT_HANDOFF.md) — a distilled,
-action-oriented briefing covering the golden rules (AOP-G1 through
-AOP-G13), the playbooks for common tasks, and the publish flow. If
-someone proposes bringing the native hook backend back, first read
-[`docs/BYTEHOOK_LESSONS.md`](docs/BYTEHOOK_LESSONS.md).
+- **Non-incremental Transform.** To allow vendor AAR call sites to be
+  instrumented without tripping AGP 4.x's
+  `mixed_scope_dex_archive` wide-scope duplicate-class collapse,
+  NetScope's Transform reproduces AGP's scope-priority dedupe itself.
+  That requires a fresh global seen-set each run, so the Transform
+  opts out of incremental builds. Full rebuilds cost a few seconds
+  more; the per-class bytecode prefilter keeps this minimal. Vendor
+  AAR call sites ARE covered by `getApiStats()`.
+- **Plugin order matters.** If AspectJ is also in the build, apply
+  it **before** NetScope. NetScope skips `$ajc$` / `$AjcClosure`
+  classes so AspectJ's weaving is preserved, but reversing the order
+  can leave AspectJ trying to weave over already-rewritten call
+  sites.
 
 ## Build from Source
 
