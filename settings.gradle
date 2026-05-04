@@ -22,4 +22,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = "NetScope"
 include ':netscope-sdk'
+include ':netscope-hook'
 include ':app'

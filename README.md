@@ -4,18 +4,16 @@
 [![API](https://img.shields.io/badge/API-29%2B-brightgreen.svg)](https://android-arsenal.com/api?level=29)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-A lightweight Android SDK that reports:
+A lightweight Android SDK that reports four independent layers of network
+traffic — designed for diagnosing gaps between system-level stats and
+per-API attribution:
 
-- **Layer A — Kernel-level total traffic for your UID since `init()`**
-  via `android.net.TrafficStats`. Includes Java, Kotlin, C++, NDK,
-  native libraries, raw sockets — anything the kernel counts for your
-  app.
-- **Layer B — Per-API (host + path) Java-layer breakdown** via
-  build-time AOP instrumentation of `OkHttpClient.Builder.build()`,
-  `HttpsURLConnection`, and `OkHttpClient.newWebSocket(...)`.
-  API granularity (`api.example.com/v1/users/:id`) — numeric IDs,
-  UUIDs, and long hex segments are templated so traffic for the same
-  endpoint shape aggregates into one row.
+| Layer | Source | Granularity | Module |
+|-------|--------|-------------|--------|
+| **A — Kernel total** | `TrafficStats.getUid{Tx,Rx}Bytes` | UID total | `netscope-sdk` |
+| **B — Java AOP** | Build-time ASM instrumentation | `host + path` | `netscope-sdk` |
+| **C — C++ HTTP client** | `tn::http::client` callback via JNI | `host + path` | `netscope-sdk` |
+| **D — Socket hook** | Self-written PLT GOT hook | `IP:port` | `netscope-hook` (optional) |
 
 Zero source-code changes to the host app. Works on phones, tablets,
 and **Android Automotive** / OEM car head-units where `VpnService` /
@@ -58,6 +56,90 @@ so native / non-instrumented traffic is not missing.
                                              ▼
                                 getTotalStats
 ```
+
+## 4-Layer Traffic Analysis
+
+The four layers are **independent views of the same traffic, not additive
+buckets**. A single HTTPS request may appear in Layer B (Java AOP) AND
+Layer C (C++ callback) AND Layer D (socket hook) simultaneously. The
+purpose is cross-validation, not summation.
+
+### Verification relationships
+
+```
+Layer A  ≈  sum(Layer D)                    // D covers all TCP/UDP sockets;
+                                             // gap = DNS-only connections or connections
+                                             // closed before hooks were installed
+Layer B + Layer C  ≈  Layer A               // if B+C < A, traffic exists outside
+                                             // Java HTTP and tn::http::client
+Layer A - Layer B - Layer C  = unattributed // NDK, WebView, asdk.httpclient, etc.
+```
+
+**Do NOT sum B + C + D and compare to A** — you will triple-count every
+request that appears in all three.
+
+### Layer A — Kernel total
+
+`getTotalStats()` reads `TrafficStats.getUid{Tx,Rx}Bytes` minus a
+baseline captured at `init()`. This is the authoritative ground truth:
+everything the kernel attributes to your UID (Java, Kotlin, C++, NDK,
+raw sockets, prebuilt binaries). Use this to check whether B + C fully
+explains the traffic.
+
+### Layer B — Java AOP per-API
+
+`getApiStats()` is populated at build time by the Gradle Transform.
+Only call sites that go through the instrumented OkHttp / URLConnection
+paths appear here. Per-`(host, path)`, cumulative since `init()`.
+
+### Layer C — C++ HTTP client per-API
+
+`getCppApiStats()` is populated by `NetScope.reportCppFlow()`, which the
+HMI calls from a `tn::http::client::injectGlobalOption` callback. The
+reference integration bridge is in `docs/cpp-bridge/`:
+
+```kotlin
+// HMI native side (C++) — call once during FoundationJni init:
+netscope_install_cpp_hook(env, netscope_instance);
+
+// Kotlin side — query at any time:
+val cppStats: List<CppApiStats> = NetScope.getCppApiStats()
+cppStats.forEach { s ->
+    Log.d("NetScope", "[C] ${s.key}  ↑${s.txBytes}  ↓${s.rxBytes}  req=${s.requestCount}")
+}
+```
+
+Layer C has the same `host + path` granularity as Layer B; you can
+compare them row-by-row for the same endpoints.
+
+### Layer D — Socket hook per-IP:port (optional)
+
+`NetScopeHook.getSocketStats()` is populated by `libnetscope_hook.so`,
+which patches the GOT entries for `connect`, `send`, `sendto`,
+`sendmsg`, `recv`, `recvfrom`, `recvmsg`, `write`, `read`, and `close`
+in all loaded `.so` files at runtime. On `close`, accumulated tx/rx for
+the fd is flushed into a per-`IP:port` aggregation table.
+
+```kotlin
+class MyApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        NetScope.init(this)
+
+        // Optional: Layer D
+        NetScopeHook.init(this)     // loads libnetscope_hook.so; silent on failure
+        NetScopeHook.start()        // installs GOT hooks; returns false if failed
+    }
+}
+
+// Query at any time:
+val socketStats: List<SocketStats> = NetScopeHook.getSocketStats()
+val socketTotal: SocketTotalStats  = NetScopeHook.getSocketTotalStats()
+// socketTotal.txTotal ≈ getTotalStats().txTotal  (cross-validation)
+```
+
+Layer D requires `netscope-hook` module. Init failure (missing NDK ABI,
+W^X kernel, etc.) is silent — the main SDK remains unaffected.
 
 ### Layer A vs Layer B — what each number means
 
@@ -191,7 +273,9 @@ apply plugin: 'kotlin-android'
 apply plugin: 'indi.arrowyi.netscope'
 
 dependencies {
-    implementation 'com.github.Arrowyi.NetScope:NetScope:v3.0.1'
+    implementation 'com.github.Arrowyi.NetScope:NetScope:v3.1.0'
+    // Optional — Layer D socket hook (requires NDK on device's ABI):
+    implementation 'com.github.Arrowyi.NetScope:NetScopeHook:v3.1.0'
 }
 ```
 
@@ -212,12 +296,22 @@ class MyApplication : Application() {
         NetScope.setOnFlowEnd { stats ->    // optional per-flow callback
             Log.d("NetScope", "${stats.key} ↑${stats.txBytesInterval} ↓${stats.rxBytesInterval}")
         }
+
+        // Optional — Layer D socket hook
+        NetScopeHook.init(this)   // loads libnetscope_hook.so; silent on failure
+        NetScopeHook.start()      // installs GOT hooks
     }
 }
 ```
 
 No changes anywhere else in your app. Your OkHttp clients, URL
 connections, and WebSockets are instrumented at build time.
+
+For **Layer C** (C++ HTTP client stats), drop
+`docs/cpp-bridge/netscope_cpp_bridge.{h,cpp}` into your HMI native
+build alongside `DataUsageCollector.cpp` and call
+`netscope_install_cpp_hook(env, nullptr)` once during native
+initialisation. No changes to the Kotlin side are needed.
 
 ## API Reference
 
@@ -228,11 +322,14 @@ connections, and WebSockets are instrumented at build time.
 | `init(context): Status` | Idempotent. Clears per-API counters and captures a `TrafficStats` baseline so numbers are "since `init()`". Always returns `ACTIVE`. |
 | `status(): Status` | Current state: `NOT_INITIALIZED` or `ACTIVE`. |
 | `pause()` / `resume()` | Suspend / resume **per-API** counting. Affects Layer B only — `getTotalStats()` (Layer A / kernel) keeps counting. |
-| `clearStats()` | Reset per-API counters AND re-capture kernel baseline, so both layers restart from 0. |
+| `clearStats()` | Reset Layer B counters AND re-capture kernel baseline. Also clears Layer C counters. |
 | `markIntervalBoundary()` | Freeze current-interval counters into the interval snapshot; start a new interval. |
 | `getApiStats(): List<ApiStats>` | **Layer B.** AOP per-API (host + path) cumulative since `init()` / last `clearStats()`. Java-only. Sorted by total bytes desc. |
 | `getIntervalStats(): List<ApiStats>` | Last completed interval's per-API stats. |
 | `getTotalStats(): TotalStats` | **Layer A.** Kernel-level UID traffic (Java + native + NDK) since `init()`. Source: `TrafficStats.getUid{Tx,Rx}Bytes`. |
+| `getCppApiStats(): List<CppApiStats>` | **Layer C.** C++ HTTP client per-API stats, populated via `reportCppFlow()`. Cumulative since `init()` / last `clearCppApiStats()`. |
+| `clearCppApiStats()` | Reset Layer C counters only. |
+| `reportCppFlow(rawUrl, txBytes, rxBytes, durationMs)` | JNI entry point. Called by the native bridge (`docs/cpp-bridge/`) — not typically called from Kotlin. `@JvmStatic`. |
 | `setLogInterval(seconds: Int)` | Start / stop periodic `adb logcat` reports (tag `NetScope`). Pass `0` to stop. |
 | `setOnFlowEnd(cb?)` | Register per-flow-close callback. Pass `null` to clear. |
 | `destroy()` | Stop the reporter and clear state. Instrumentation stays in the bytecode; rebuild without the plugin to fully remove. |
@@ -257,6 +354,48 @@ connections, and WebSockets are instrumented at build time.
 | `txTotal` / `rxTotal` | `Long` | Kernel-counted bytes for our UID since `init()` (covers Java + native + NDK). Falls back to AOP sum on pre-Q OEM kernels that return `TrafficStats.UNSUPPORTED`. |
 | `connCountTotal` | `Int` | AOP-observed Java-layer flow-close count. Kernel has no "connection close" concept for native sockets, so this stays Java-only. |
 | `totalBytes` | `Long` | Computed: `txTotal + rxTotal` |
+
+### `CppApiStats` (data class, Layer C)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `host` | `String` | Target host (formatted same as `ApiStats.host`). |
+| `path` | `String` | Normalised URL path (same rules as `ApiStats.path`). |
+| `key` | `String` | Derived: `"$host$path"`. |
+| `txBytes` / `rxBytes` | `Long` | Cumulative bytes since `init()` / last `clearCppApiStats()`. |
+| `requestCount` | `Int` | Number of completed C++ HTTP requests. |
+| `totalTransferTimeMs` | `Double` | Sum of per-request transfer times in milliseconds. |
+| `totalBytes` | `Long` | Computed: `txBytes + rxBytes`. |
+| `avgTransferTimeMs` | `Double` | Computed: `totalTransferTimeMs / requestCount`. |
+
+### `SocketStats` (data class, Layer D)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `remoteAddress` | `String` | `"203.0.113.1:443"` format — IP + port as seen by `connect()`. |
+| `txBytes` / `rxBytes` | `Long` | Cumulative bytes since last `clearSocketStats()`. |
+| `connectionCount` | `Int` | Number of `close()` calls on fds that connected to this address. |
+| `totalBytes` | `Long` | Computed: `txBytes + rxBytes`. |
+
+### `SocketTotalStats` (data class, Layer D)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `txTotal` / `rxTotal` | `Long` | Sum of all `SocketStats.txBytes` / `rxBytes`. |
+| `connectionCount` | `Int` | Total closed connections across all addresses. |
+| `totalBytes` | `Long` | Computed: `txTotal + rxTotal`. |
+
+### `NetScopeHook` (object, in `netscope-hook`)
+
+| Method | Description |
+|--------|-------------|
+| `init(context)` | Loads `libnetscope_hook.so` via `System.loadLibrary`. Silent on failure (missing ABI, W^X kernel, etc.). |
+| `start(): Boolean` | Installs GOT hooks. Returns `false` if `init()` failed or patching failed. |
+| `stop()` | Uninstalls GOT hooks, restoring original function pointers. |
+| `isActive: Boolean` | Whether hooks are currently installed. |
+| `getSocketStats(): List<SocketStats>` | **Layer D.** Per-`IP:port` stats snapshot. |
+| `getSocketTotalStats(): SocketTotalStats` | **Layer D.** Total across all sockets. Compare `txTotal` to `getTotalStats().txTotal` for cross-validation. |
+| `clearSocketStats()` | Reset Layer D counters. |
 
 ## Logcat Output Format
 

@@ -2,39 +2,41 @@ package indi.arrowyi.netscope.sdk
 
 import android.content.Context
 import android.util.Log
+import indi.arrowyi.netscope.sdk.internal.CppTrafficAggregator
+import indi.arrowyi.netscope.sdk.internal.EndpointFormatter
+import indi.arrowyi.netscope.sdk.internal.PathNormalizer
 import indi.arrowyi.netscope.sdk.internal.SystemTrafficReader
 import indi.arrowyi.netscope.sdk.internal.TrafficAggregator
 
 /**
  * Entry point for NetScope traffic statistics.
  *
- * **Architecture (v3.0.0+):** two layers.
+ * **Architecture:** four layers (v4.0 adds Layers C and D).
  *
- *   Layer A — [getTotalStats]: kernel-level *total* UID traffic since
- *   [init], obtained via [android.net.TrafficStats]. Includes
- *   everything the kernel counts for this process's UID: Java, Kotlin,
- *   C++, NDK, signed native blobs, raw sockets — whether or not
- *   NetScope's AOP layer saw it.
+ *   Layer A — [getTotalStats]: kernel-level *total* UID traffic since [init],
+ *   obtained via [android.net.TrafficStats]. Covers Java, Kotlin, C++, NDK,
+ *   raw sockets — everything the kernel counts for this UID.
  *
- *   Layer B — [getApiStats] / [getIntervalStats]: per-API (host+path)
- *   application-layer counters populated by the Gradle plugin's ASM
- *   instrumentation of `OkHttpClient.Builder#build`,
- *   `HttpsURLConnection`, and `OkHttpClient#newWebSocket`. Java-layer
- *   only.
+ *   Layer B — [getApiStats] / [getIntervalStats]: per-API (host+path) counters
+ *   populated by the Gradle plugin's ASM instrumentation of OkHttp, URLConnection,
+ *   and WebSocket call sites. Java-layer only.
  *
- * **Breaking change from v2.x → v3.0.0:** `DomainStats` is gone;
- * `getDomainStats()` is gone. Use [ApiStats] / [getApiStats]. An API
- * key is `"$host$path"` where:
- *   - `host` = actual host, with `:port` folded in when it's
- *     non-default for the scheme (HTTPS 443 and HTTP 80 stay elided).
- *     Raw IPs like `192.168.1.5:9000` show up verbatim. Connections we
- *     can't resolve show `<unknown>` (optionally `<unknown>:port`).
- *   - `path` = URL path with numeric IDs → `:id`, UUIDs → `:uuid`,
- *     long hex strings → `:hash`. Query/fragment stripped.
+ *   Layer C — [getCppApiStats]: per-API counters populated by C++ HTTP client
+ *   callbacks. Requires integration of the HMI native bridge (see
+ *   `docs/cpp-bridge/`) that calls [reportCppFlow] via JNI. Uses
+ *   `tn::http::client::restricted::injectGlobalOption`.
  *
- *   `sum(getApiStats().tx) <= getTotalStats().txTotal` is intentional
- *   — the gap is "non-instrumented traffic", mostly native. HMIs may
- *   surface this gap if useful.
+ *   Layer D — provided by the optional `netscope-hook` module ([NetScopeHook]).
+ *   PLT-level socket hooks that capture ALL TCP traffic by remote IP:port,
+ *   including traffic from C++ HTTP clients that are not instrumented by
+ *   Layers B or C. See [NetScopeHook.getSocketStats].
+ *
+ * **Validation relationship** (not additive — each layer is a different view):
+ * ```
+ *   sum(Layer D bytes) ≈ Layer A total      // D covers all sockets
+ *   sum(Layer B) + sum(Layer C) ≈ sum(Layer D)  // B+C attribution should explain D
+ *   Gap = Layer A - Layer B - Layer C       // non-attributed native traffic
+ * ```
  *
  * Thread-safe. All methods may be called from any thread.
  */
@@ -43,6 +45,7 @@ object NetScope {
     private const val TAG = "NetScope"
 
     internal val aggregator = TrafficAggregator()
+    internal val cppAggregator = CppTrafficAggregator()
 
     @Volatile private var initialized: Boolean = false
     @Volatile private var flowEndCallback: ((ApiStats) -> Unit)? = null
@@ -102,13 +105,14 @@ object NetScope {
     /**
      * Reset all collected stats.
      *
-     * Clears per-API AOP counters (Layer B) AND re-captures the
-     * Layer-A kernel baseline, so both totals and per-API numbers
-     * restart from zero.
+     * Clears Layer B (AOP) and Layer C (C++ callback) counters AND
+     * re-captures the Layer-A kernel baseline, so all totals restart from zero.
+     * Layer D (socket hook) stats are managed separately via [NetScopeHook].
      */
     @Synchronized
     fun clearStats() {
         aggregator.clear()
+        cppAggregator.clear()
         if (initialized) {
             val tx = reader.getUidTxBytes()
             val rx = reader.getUidRxBytes()
@@ -221,6 +225,53 @@ object NetScope {
         aggregator.addRx(host, path, bytes)
     }
 
+    // ─── Layer C: C++ HTTP client stats ─────────────────────────────────────
+    //
+    // Populated by the HMI's native bridge code calling reportCppFlow via JNI.
+    // The bridge hooks tn::http::client::restricted::injectGlobalOption and
+    // forwards each completed request here. See docs/cpp-bridge/ for the
+    // reference implementation.
+
+    /**
+     * Cumulative per-API stats from C++ HTTP client callbacks (Layer C).
+     *
+     * Each entry represents one (host, path) tuple observed by the C++ HTTP
+     * client. Independent of [getApiStats] (Layer B); both may record the same
+     * endpoint when both Java and C++ stacks talk to it — that is expected
+     * and useful for cross-validation.
+     *
+     * Returns an empty list until the HMI native bridge calls [reportCppFlow].
+     * Sorted by total bytes descending.
+     */
+    fun getCppApiStats(): List<CppApiStats> =
+        cppAggregator.getCppApiStats().sortedByDescending { it.totalBytes }
+
+    /**
+     * Reset Layer C counters. Does not affect Layer A, B, or D.
+     */
+    fun clearCppApiStats() { cppAggregator.clear() }
+
+    /**
+     * Entry point called from the HMI's native bridge via JNI when a C++
+     * HTTP request completes. Parses `rawUrl` into (host, path) using the
+     * same [EndpointFormatter] and [PathNormalizer] rules as Layer B.
+     *
+     * Not intended to be called directly by Kotlin/Java application code.
+     * Use the `docs/cpp-bridge/` reference implementation for the C++ side.
+     *
+     * @param rawUrl   full URL string as reported by `tn::http::client` (e.g.
+     *                 `https://api.example.com:8080/v1/users/123`).
+     * @param txBytes  bytes sent for this request (>= 0).
+     * @param rxBytes  bytes received in the response (>= 0).
+     * @param durationMs total transfer time in milliseconds (>= 0).
+     */
+    @JvmStatic
+    fun reportCppFlow(rawUrl: String, txBytes: Long, rxBytes: Long, durationMs: Double) {
+        if (!initialized) return
+        val (host, path) = parseUrl(rawUrl)
+        cppAggregator.report(host, path, txBytes, rxBytes, durationMs)
+    }
+
     /**
      * Uninstall runtime state (stop the log reporter, clear the flow-end
      * callback). Instrumentation stays in place — to truly remove it,
@@ -230,6 +281,30 @@ object NetScope {
     fun destroy() {
         LogcatReporter.stop()
         flowEndCallback = null
+        cppAggregator.clear()
         initialized = false
+    }
+
+    // ─── Private helpers ─────────────────────────────────────────────────────
+
+    /**
+     * Parse a raw URL into (host, path) using the same normalisation rules
+     * as the AOP layer. Returns (<unknown>, /) on any malformed input rather
+     * than throwing.
+     */
+    private fun parseUrl(rawUrl: String): Pair<String, String> {
+        return try {
+            val url = java.net.URL(rawUrl)
+            val defaultPort = when (url.protocol.lowercase()) {
+                "https", "wss" -> 443
+                "http", "ws"   -> 80
+                else           -> -1
+            }
+            val host = EndpointFormatter.format(url.host, url.port, defaultPort)
+            val path = PathNormalizer.normalize(url.path.ifEmpty { "/" })
+            Pair(host, path)
+        } catch (_: Exception) {
+            Pair(EndpointFormatter.UNKNOWN_HOST, "/")
+        }
     }
 }

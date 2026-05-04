@@ -1,0 +1,85 @@
+plugins {
+    id 'com.android.library'
+    id 'org.jetbrains.kotlin.android'
+    id 'maven-publish'
+}
+
+// netscope-hook: optional Layer D — socket-level PLT hook module.
+//
+// libnetscope_hook.so contains ONLY: got_patcher.c, socket_proxy.c,
+// fd_table.c, hook_jni.c. No third-party hook library (no shadowhook,
+// no bytehook) is linked or listed in DT_NEEDED.
+//
+// This module has NO dependency on :netscope-sdk — it is fully standalone.
+// HMI adds BOTH modules independently:
+//   implementation 'com.github.Arrowyi.NetScope:NetScope:<tag>'       // SDK
+//   implementation 'com.github.Arrowyi.NetScope:NetScopeHook:<tag>'  // Hook (optional)
+
+android {
+    namespace 'indi.arrowyi.netscope.hook'
+    compileSdk 34
+
+    // Match the NDK used by the host app (tasdk defaults to r25c).
+    // Override via local.properties: ndk.dir=/path/to/ndk
+    ndkVersion "25.2.9519653"   // NDK r25c (25.2 variant) — 25.1 has no source.properties on this machine
+
+    defaultConfig {
+        minSdk 29
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles "consumer-rules.pro"
+
+        externalNativeBuild {
+            cmake {
+                // Target only the ABIs that tasdk ships (arm64-v8a and x86_64).
+                // Add armeabi-v7a here if 32-bit IVI targets are needed.
+                abiFilters "arm64-v8a", "x86_64"
+                cFlags "-Wall", "-Wextra", "-O2"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.11.0+"
+        }
+    }
+
+    buildTypes {
+        release { minifyEnabled false }
+        debug   { jniDebuggable true }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions { jvmTarget = '1.8' }
+
+    publishing {
+        singleVariant('release') { withSourcesJar() }
+    }
+}
+
+dependencies {
+    implementation 'androidx.annotation:annotation:1.7.1'
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test:runner:1.5.2'
+}
+
+publishing {
+    publications {
+        release(MavenPublication) {
+            groupId    = 'com.github.Arrowyi'
+            artifactId = 'NetScopeHook'
+            version    = System.getenv('VERSION') ?: '1.0.0'
+            afterEvaluate { from components.release }
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url  = uri("${rootProject.buildDir}/repo")
+        }
+    }
+}

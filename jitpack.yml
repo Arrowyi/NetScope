@@ -16,19 +16,26 @@ jdk:
 # it. (See docs/HOOK_EVOLUTION.md and docs/BYTEHOOK_LESSONS.md for the
 # now-retired native-build story.)
 #
-# Two artifacts are published. Because JitPack sees two modules in a
-# single repo, it serves them under its *multi-module* coordinate scheme
+# Three artifacts are published. Because JitPack sees multiple modules in
+# a single repo, it serves them under its *multi-module* coordinate scheme
 # (groupId = com.github.<owner>.<repo>, note the dot):
 #   * `com.github.Arrowyi.NetScope:NetScope:<tag|sha>`        — the AAR (Kotlin runtime)
 #   * `com.github.Arrowyi.NetScope:NetScope-plugin:<tag|sha>` — the Gradle plugin jar
+#   * `com.github.Arrowyi.NetScope:NetScopeHook:<tag|sha>`    — the hook module AAR (optional)
 # HMI consumes them with:
 #   classpath      'com.github.Arrowyi.NetScope:NetScope-plugin:<...>'
 #   implementation 'com.github.Arrowyi.NetScope:NetScope:<...>'
+#   implementation 'com.github.Arrowyi.NetScope:NetScopeHook:<...>'  // optional
 #
 # The plugin is a composite build (see settings.gradle
 # `pluginManagement.includeBuild 'netscope-plugin'`), so its publish
 # task is addressed by invoking Gradle directly inside the plugin
 # directory with `-p netscope-plugin`.
+#
+# The hook module requires NDK r25c. JitPack's build image does not
+# include NDK by default; the build will pick up whatever NDK is
+# installed. Set ndkVersion in netscope-hook/build.gradle accordingly.
 install:
   - env -u JAVA_TOOL_OPTIONS ./gradlew :netscope-sdk:publishReleasePublicationToMavenLocal
   - env -u JAVA_TOOL_OPTIONS ./gradlew -p netscope-plugin publishReleasePublicationToMavenLocal
+  - env -u JAVA_TOOL_OPTIONS ./gradlew :netscope-hook:publishReleasePublicationToMavenLocal
