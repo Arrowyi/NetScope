@@ -4,231 +4,123 @@
 [![API](https://img.shields.io/badge/API-29%2B-brightgreen.svg)](https://android-arsenal.com/api?level=29)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-A lightweight Android SDK that reports four independent layers of network
-traffic — designed for diagnosing gaps between system-level stats and
-per-API attribution:
+An Android network-traffic monitoring SDK that exposes **four independent
+diagnostic layers** — designed to cross-validate per-API attribution
+against system-level totals and find hidden traffic consumers.
 
-| Layer | Source | Granularity | Module |
-|-------|--------|-------------|--------|
-| **A — Kernel total** | `TrafficStats.getUid{Tx,Rx}Bytes` | UID total | `netscope-sdk` |
-| **B — Java AOP** | Build-time ASM instrumentation | `host + path` | `netscope-sdk` |
-| **C — C++ HTTP client** | `tn::http::client` callback via JNI | `host + path` | `netscope-sdk` |
-| **D — Socket hook** | Self-written PLT GOT hook | `IP:port` | `netscope-hook` (optional) |
+| Layer | Name | Data source | Granularity | Module |
+|-------|------|-------------|-------------|--------|
+| **A** | Kernel total | `TrafficStats.getUid{Tx,Rx}Bytes` | UID total | `netscope-sdk` |
+| **B** | Java AOP | Build-time ASM bytecode transform | `host + path` | `netscope-sdk` |
+| **C** | C++ HTTP client | `tn::http::client` callback → JNI | `host + path` | `netscope-sdk` |
+| **D** | Socket hook | Self-written PLT / GOT hook | `IP:port` | `netscope-hook` *(optional)* |
 
-Zero source-code changes to the host app. Works on phones, tablets,
-and **Android Automotive** / OEM car head-units where `VpnService` /
-root are unavailable.
+Zero source-code changes to the host app. Works on phones, tablets, and
+**Android Automotive / OEM car head-units** where `VpnService` / root are
+unavailable.
+
+---
 
 ## How It Works
 
-NetScope uses **build-time AOP (ASM bytecode instrumentation)** via a
-Gradle Transform plugin. When you apply `indi.arrowyi.netscope` to
-your app module, every call to:
+### Layer B — Java AOP (build-time)
+
+The `indi.arrowyi.netscope` Gradle plugin applies an ASM bytecode
+Transform at compile time. Every call to:
 
 - `OkHttpClient.Builder.build()`
-- `HttpsURLConnection.getInputStream()` / `getOutputStream()` (including
-  `HttpURLConnection`, `URLConnection`)
+- `HttpsURLConnection.getInputStream()` / `getOutputStream()` (including `HttpURLConnection`, `URLConnection`)
 - `OkHttpClient.newWebSocket(...)`
 
-is rewritten at compile time to route through lightweight NetScope
-wrappers that count bytes per-API (host + normalised path). For the
-*total* number, NetScope additionally reads kernel-level `TrafficStats`
-so native / non-instrumented traffic is not missing.
+is rewritten to route through lightweight NetScope wrappers that count
+bytes per `(host, normalised-path)` pair.
+
+### Layer A — Kernel total (runtime)
+
+At `init()` NetScope captures a `TrafficStats` baseline and subtracts it
+on every `getTotalStats()` call. This covers **all** traffic your UID
+produces — Java, Kotlin, C++, NDK, raw sockets, prebuilt `.so` files.
+It is the ground-truth against which the other layers are validated.
+
+### Layer C — C++ HTTP client (runtime, opt-in integration)
+
+The HMI's native build drops in two reference files
+(`netscope_cpp_bridge.h/cpp`) and calls `netscope_install_cpp_hook()` once
+during native initialisation. The bridge injects a global
+`tn::http::client::injectGlobalOption()` callback that forwards each
+completed request to `NetScope.reportCppFlow()` via JNI.
+
+### Layer D — Socket hook (runtime, optional module)
+
+`libnetscope_hook.so` (shipped in the separate `netscope-hook` module)
+patches the GOT entries of `connect`, `send`, `sendto`, `sendmsg`,
+`recv`, `recvfrom`, `recvmsg`, `write`, `read`, and `close` in every
+loaded `.so` at runtime. On each `close()` the accumulated tx/rx for
+that fd is flushed into a per-`IP:port` aggregation table.
+
+The patcher uses only `dl_iterate_phdr` + `mprotect` on existing pages —
+no `mmap(PROT_EXEC)`, no third-party hook libraries, W^X-kernel-safe.
 
 ```
-          Java HTTPS / OkHttp              HttpsURLConnection                 OkHttp WebSocket
-                  │                                │                                   │
-                  ▼                                ▼                                   ▼
-        ┌─────────────────────────────────────────────────────────────────────────────────────┐
-        │  NetScope Gradle Transform (applied at build time)                                  │
-        │  OkHttpClient$Builder.build()     → + NetScopeInterceptor                           │
-        │  URLConnection.getInputStream()    → + counting InputStream                         │
-        │  OkHttpClient.newWebSocket()       → wrapped listener + wrapped WebSocket           │
-        └────────────────────────────────────┬────────────────────────────────────────────────┘
-                                             ▼
-        Layer B: TrafficAggregator (AtomicLong counters, key = host + path)
-                                             ▼
-                                getApiStats / getIntervalStats
+  Java OkHttp / URLConnection / WebSocket
+          │
+          ▼
+  ┌───────────────────────────────────────────────┐
+  │  NetScope Gradle Transform  (build time)       │  ← Layer B
+  │  .build()   → + NetScopeInterceptor            │
+  │  .getInputStream() → + counting stream         │
+  │  .newWebSocket() → wrapped listener/WebSocket  │
+  └───────────────────────┬───────────────────────┘
+                          ▼
+              TrafficAggregator   getApiStats()
 
-          Kernel (xt_qtaguid / eBPF)  ──►  TrafficStats.getUid{Tx,Rx}Bytes
-                                             ▼
-               Layer A: baseline captured at init(), subtracted on read
-                                             ▼
-                                getTotalStats
+  tn::http::client callback (C++ side, via JNI)
+          │
+          ▼
+  NetScope.reportCppFlow(url, tx, rx, ms)          ← Layer C
+          ▼
+      CppTrafficAggregator   getCppApiStats()
+
+  connect / send / recv / close  (all .so files)
+          │
+          ▼
+  libnetscope_hook.so  GOT patcher                 ← Layer D (optional)
+          ▼
+      fd_table aggregation   NetScopeHook.getSocketStats()
+
+  Kernel  xt_qtaguid / eBPF
+          │
+          ▼
+  TrafficStats.getUid{Tx,Rx}Bytes                  ← Layer A
+          ▼
+      NetScope.getTotalStats()
 ```
 
-## 4-Layer Traffic Analysis
+---
+
+## 4-Layer Cross-Validation
 
 The four layers are **independent views of the same traffic, not additive
-buckets**. A single HTTPS request may appear in Layer B (Java AOP) AND
-Layer C (C++ callback) AND Layer D (socket hook) simultaneously. The
-purpose is cross-validation, not summation.
-
-### Verification relationships
+buckets**. A single HTTPS request may appear in Layer B *and* Layer C
+*and* Layer D simultaneously. The purpose is cross-validation, not
+summation.
 
 ```
-Layer A  ≈  sum(Layer D)                    // D covers all TCP/UDP sockets;
-                                             // gap = DNS-only connections or connections
-                                             // closed before hooks were installed
-Layer B + Layer C  ≈  Layer A               // if B+C < A, traffic exists outside
-                                             // Java HTTP and tn::http::client
-Layer A - Layer B - Layer C  = unattributed // NDK, WebView, asdk.httpclient, etc.
+Layer A  ≈  sum(Layer D)
+    // D covers all TCP sockets; gap ≈ UDP/DNS and sockets closed
+    // before hooks were installed
+
+Layer B + Layer C  ≈  Layer A
+    // if B+C < A: traffic exists outside Java HTTP and tn::http::client
+
+Layer A − Layer B − Layer C  =  unattributed gap
+    // NDK, WebView, asdk.httpclient, raw sockets, prebuilt binaries
 ```
 
 **Do NOT sum B + C + D and compare to A** — you will triple-count every
 request that appears in all three.
 
-### Layer A — Kernel total
-
-`getTotalStats()` reads `TrafficStats.getUid{Tx,Rx}Bytes` minus a
-baseline captured at `init()`. This is the authoritative ground truth:
-everything the kernel attributes to your UID (Java, Kotlin, C++, NDK,
-raw sockets, prebuilt binaries). Use this to check whether B + C fully
-explains the traffic.
-
-### Layer B — Java AOP per-API
-
-`getApiStats()` is populated at build time by the Gradle Transform.
-Only call sites that go through the instrumented OkHttp / URLConnection
-paths appear here. Per-`(host, path)`, cumulative since `init()`.
-
-### Layer C — C++ HTTP client per-API
-
-`getCppApiStats()` is populated by `NetScope.reportCppFlow()`, which the
-HMI calls from a `tn::http::client::injectGlobalOption` callback. The
-reference integration bridge is in `docs/cpp-bridge/`:
-
-```kotlin
-// HMI native side (C++) — call once during FoundationJni init:
-netscope_install_cpp_hook(env, netscope_instance);
-
-// Kotlin side — query at any time:
-val cppStats: List<CppApiStats> = NetScope.getCppApiStats()
-cppStats.forEach { s ->
-    Log.d("NetScope", "[C] ${s.key}  ↑${s.txBytes}  ↓${s.rxBytes}  req=${s.requestCount}")
-}
-```
-
-Layer C has the same `host + path` granularity as Layer B; you can
-compare them row-by-row for the same endpoints.
-
-### Layer D — Socket hook per-IP:port (optional)
-
-`NetScopeHook.getSocketStats()` is populated by `libnetscope_hook.so`,
-which patches the GOT entries for `connect`, `send`, `sendto`,
-`sendmsg`, `recv`, `recvfrom`, `recvmsg`, `write`, `read`, and `close`
-in all loaded `.so` files at runtime. On `close`, accumulated tx/rx for
-the fd is flushed into a per-`IP:port` aggregation table.
-
-```kotlin
-class MyApplication : Application() {
-    override fun onCreate() {
-        super.onCreate()
-        NetScope.init(this)
-
-        // Optional: Layer D
-        NetScopeHook.init(this)     // loads libnetscope_hook.so; silent on failure
-        NetScopeHook.start()        // installs GOT hooks; returns false if failed
-    }
-}
-
-// Query at any time:
-val socketStats: List<SocketStats> = NetScopeHook.getSocketStats()
-val socketTotal: SocketTotalStats  = NetScopeHook.getSocketTotalStats()
-// socketTotal.txTotal ≈ getTotalStats().txTotal  (cross-validation)
-```
-
-Layer D requires `netscope-hook` module. Init failure (missing NDK ABI,
-W^X kernel, etc.) is silent — the main SDK remains unaffected.
-
-### Layer A vs Layer B — what each number means
-
-`getTotalStats()` is "since `init()`, kernel-level, all sources".
-`getApiStats()` is "since `init()`, AOP-observed Java HTTP/S, one
-entry per (host, path)". The **gap** between them is non-instrumented
-traffic — native HTTP clients, NDK / C++ code, libcurl, raw
-`java.net.Socket`, signed binary blobs, plus anything emitted from a
-class the Transform skips (see [What gets instrumented](#what-gets-instrumented)).
-By construction:
-
-```
-sum(getApiStats().tx) <= getTotalStats().txTotal
-```
-
-HMIs that want to surface attribution can render the difference
-explicitly:
-
-```kotlin
-val total      = NetScope.getTotalStats()
-val attributed = NetScope.getApiStats().sumOf { it.txBytesTotal + it.rxBytesTotal }
-val unattributed = total.totalBytes - attributed   // native + non-instrumented Java
-```
-
-### API key shape
-
-Each `ApiStats` has two string fields and a derived `key = "$host$path"`:
-
-| Field | Example |
-|---|---|
-| `host` | `api.example.com` (default-port scheme) |
-|   | `api.example.com:8080` (non-default port surfaces automatically) |
-|   | `192.168.1.5:9000` (raw IP + port for mystery internal services) |
-|   | `<unknown>` or `<unknown>:9000` (unresolvable host; port preserved when known) |
-| `path` | `/v1/users` (verbatim) |
-|   | `/v1/users/:id` (numeric IDs templated) |
-|   | `/accounts/:uuid/avatar` (UUIDs templated) |
-|   | `/file/:hash` (long hex strings templated) |
-|   | Query strings (`?q=...`) and fragments (`#...`) are stripped; trailing slashes dropped; `GET` and `POST` against the same path merge. |
-
-Port handling drops the scheme default (HTTPS `:443` / HTTP `:80`) so
-ordinary traffic stays clean, but a non-default port always shows up —
-the same `api.example.com` on two different ports splits into two API
-entries, which matches what the kernel / network actually treats them
-as.
-
-### Which URLs get counted
-
-The Gradle Transform rewrites *every* `URLConnection.getInputStream()`
-/ `getOutputStream()` call site in the app. At runtime NetScope
-classifies the connection's URL before wrapping:
-
-| URL | Counted? | Rationale |
-|---|---|---|
-| `http://…`, `https://…` | yes | obvious |
-| `ftp://…`, `sftp://…`, custom socket schemes | yes | touches the wire |
-| `jar:http://host/x.jar!/entry` | yes | inner URL is remote |
-| `file:/data/…` | no | local filesystem |
-| `content://…` | no | Android ContentProvider |
-| `asset:`, `android.resource:`, `res:`, `data:` | no | local |
-| `jar:file:/…!/entry` | no | inner URL is local |
-
-The classifier uses a local-scheme **denylist** rather than an
-http(s) **allowlist**. If a new over-the-wire transport appears
-(say `quic:`), it will be counted by default — the denylist bias is
-deliberately conservative about missing traffic and liberal about
-counting it. Local-filesystem reads via `URLConnection` therefore
-never leak into `getApiStats()` under an `<unknown>/…` row.
-
-### Why this architecture
-
-AOP + `TrafficStats` together give you "total traffic including
-native" **without** shipping any native library. The Java layer is
-visible per-API; the kernel layer fills in everything else (NDK,
-WebView, raw sockets, prebuilt binaries). No `VpnService`, no root,
-no native hook — works on locked-down OEM devices.
-
-### No double counting, no missed flows
-
-Every NetScope wrapper implements a `NetScopeInstrumented` marker
-interface. Both the Gradle Transform and the runtime injectors check
-for the marker before wrapping, so:
-
-- Manually adding `NetScopeInterceptor` + having the Transform run = 1×
-  count (not 2×).
-- A `URLConnection` whose stream is already wrapped won't be
-  double-wrapped by a nested instrumentation site.
-- If a flow goes through multiple layers (e.g. OkHttp on top of a
-  wrapped `URLConnection`), only the top-most wrapping counts.
+---
 
 ## Requirements
 
@@ -239,6 +131,9 @@ for the marker before wrapping, so:
 | Gradle | 6.7.1+ |
 | JDK running Gradle | 8+ |
 | Kotlin | 1.6.21+ |
+| NDK *(Layer D only)* | r25c (25.2.9519653 recommended) |
+
+---
 
 ## Integration
 
@@ -254,36 +149,30 @@ buildscript {
         maven { url 'https://jitpack.io' }
     }
     dependencies {
-        // groupId is `com.github.Arrowyi.NetScope` (DOT, not colon) —
-        // JitPack multi-module convention because both artifacts come
-        // from the same repo.
-        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v3.0.1'
+        // groupId uses a DOT, not a colon — JitPack multi-module convention.
+        classpath 'com.github.Arrowyi.NetScope:NetScope-plugin:v3.1.0'
     }
 }
 ```
 
-### Step 2 — Apply the plugin and add the runtime dependency
+### Step 2 — Apply the plugin and add runtime dependencies
 
 App-module `build.gradle`:
 
 ```groovy
 apply plugin: 'com.android.application'
 apply plugin: 'kotlin-android'
-// If you use AspectJ, apply it BEFORE NetScope.
+// If you use AspectJ, apply it BEFORE NetScope (plugin order matters).
 apply plugin: 'indi.arrowyi.netscope'
 
 dependencies {
+    // Layer A + B + C runtime
     implementation 'com.github.Arrowyi.NetScope:NetScope:v3.1.0'
-    // Optional — Layer D socket hook (requires NDK on device's ABI):
+
+    // Layer D socket hook — optional; remove if not needed
     implementation 'com.github.Arrowyi.NetScope:NetScopeHook:v3.1.0'
 }
 ```
-
-For a production build, pin to a tag from
-[Releases](https://github.com/Arrowyi/NetScope/releases) or an exact
-short SHA from
-[github.com/Arrowyi/NetScope/commits/main](https://github.com/Arrowyi/NetScope/commits/main).
-Avoid `main-SNAPSHOT` — JitPack re-resolves it on every fetch.
 
 ### Step 3 — Initialise in `Application.onCreate()`
 
@@ -291,252 +180,295 @@ Avoid `main-SNAPSHOT` — JitPack re-resolves it on every fetch.
 class MyApplication : Application() {
     override fun onCreate() {
         super.onCreate()
-        NetScope.init(this)                 // always returns ACTIVE
-        NetScope.setLogInterval(30)         // optional periodic report
-        NetScope.setOnFlowEnd { stats ->    // optional per-flow callback
+
+        // Layers A + B are active immediately after init().
+        NetScope.init(this)
+        NetScope.setLogInterval(30)          // optional periodic logcat report
+        NetScope.setOnFlowEnd { stats ->     // optional per-flow callback (Layer B)
             Log.d("NetScope", "${stats.key} ↑${stats.txBytesInterval} ↓${stats.rxBytesInterval}")
         }
 
-        // Optional — Layer D socket hook
+        // Layer D — optional socket hook
         NetScopeHook.init(this)   // loads libnetscope_hook.so; silent on failure
-        NetScopeHook.start()      // installs GOT hooks
+        NetScopeHook.start()      // installs GOT hooks; returns false if unavailable
     }
 }
 ```
 
-No changes anywhere else in your app. Your OkHttp clients, URL
-connections, and WebSockets are instrumented at build time.
+No changes anywhere else in your app — OkHttp clients, URL connections,
+and WebSockets are instrumented at build time.
 
-For **Layer C** (C++ HTTP client stats), drop
-`docs/cpp-bridge/netscope_cpp_bridge.{h,cpp}` into your HMI native
-build alongside `DataUsageCollector.cpp` and call
-`netscope_install_cpp_hook(env, nullptr)` once during native
-initialisation. No changes to the Kotlin side are needed.
+### Step 4 — Layer C: C++ HTTP client integration *(optional)*
+
+If your native build uses `tn::http::client`, copy the two reference
+files from `docs/cpp-bridge/` into your HMI native source tree and call
+`netscope_install_cpp_hook()` once during native initialisation (e.g.
+inside `JNI_OnLoad` or alongside `DataUsageCollector::install()`):
+
+```cpp
+// In your JNI_OnLoad or equivalent:
+#include "netscope_cpp_bridge.h"
+
+netscope_install_cpp_hook(env, nullptr);   // idempotent, thread-safe
+```
+
+No Kotlin-side changes are needed — stats accumulate into
+`NetScope.getCppApiStats()` automatically.
+
+---
+
+## Querying the Four Layers
+
+```kotlin
+// Layer A — kernel ground truth
+val total: TotalStats = NetScope.getTotalStats()
+
+// Layer B — Java AOP per-API
+val apiStats: List<ApiStats>  = NetScope.getApiStats()
+val interval: List<ApiStats>  = NetScope.getIntervalStats()
+
+// Layer C — C++ HTTP client per-API
+val cppStats: List<CppApiStats> = NetScope.getCppApiStats()
+
+// Layer D — socket hook per-IP:port
+val sockets:  List<SocketStats>  = NetScopeHook.getSocketStats()
+val sockTotal: SocketTotalStats  = NetScopeHook.getSocketTotalStats()
+
+// Cross-validation example
+val bTx = apiStats.sumOf { it.txBytesTotal }
+val cTx = cppStats.sumOf { it.txBytes }
+val dTx = sockTotal.txTotal
+val unattributed = total.txTotal - bTx - cTx   // traffic outside Java + tn::http
+Log.d("NetScope",
+    "A=${total.txTotal}  B=$bTx  C=$cTx  D=$dTx  gap=$unattributed")
+```
+
+---
 
 ## API Reference
 
-### `NetScope` (object)
+### `NetScope` (object, in `netscope-sdk`)
 
 | Method | Description |
 |--------|-------------|
-| `init(context): Status` | Idempotent. Clears per-API counters and captures a `TrafficStats` baseline so numbers are "since `init()`". Always returns `ACTIVE`. |
-| `status(): Status` | Current state: `NOT_INITIALIZED` or `ACTIVE`. |
-| `pause()` / `resume()` | Suspend / resume **per-API** counting. Affects Layer B only — `getTotalStats()` (Layer A / kernel) keeps counting. |
-| `clearStats()` | Reset Layer B counters AND re-capture kernel baseline. Also clears Layer C counters. |
-| `markIntervalBoundary()` | Freeze current-interval counters into the interval snapshot; start a new interval. |
-| `getApiStats(): List<ApiStats>` | **Layer B.** AOP per-API (host + path) cumulative since `init()` / last `clearStats()`. Java-only. Sorted by total bytes desc. |
-| `getIntervalStats(): List<ApiStats>` | Last completed interval's per-API stats. |
-| `getTotalStats(): TotalStats` | **Layer A.** Kernel-level UID traffic (Java + native + NDK) since `init()`. Source: `TrafficStats.getUid{Tx,Rx}Bytes`. |
-| `getCppApiStats(): List<CppApiStats>` | **Layer C.** C++ HTTP client per-API stats, populated via `reportCppFlow()`. Cumulative since `init()` / last `clearCppApiStats()`. |
+| `init(context): Status` | Idempotent. Captures a `TrafficStats` baseline; clears per-API counters. Always returns `ACTIVE`. |
+| `status(): Status` | `NOT_INITIALIZED` or `ACTIVE`. |
+| `pause()` / `resume()` | Suspend / resume Layer B counting only. Layer A kernel total keeps running. |
+| `clearStats()` | Reset Layer B + C counters and re-capture kernel baseline. |
+| `markIntervalBoundary()` | Freeze current-interval snapshot; start a new interval. |
+| `getApiStats(): List<ApiStats>` | **Layer B.** AOP per-`(host, path)`, cumulative. Sorted by total bytes desc. |
+| `getIntervalStats(): List<ApiStats>` | **Layer B.** Last completed interval's per-API stats. |
+| `getTotalStats(): TotalStats` | **Layer A.** Kernel UID bytes since `init()`. Source: `TrafficStats.getUid{Tx,Rx}Bytes`. |
+| `getCppApiStats(): List<CppApiStats>` | **Layer C.** C++ HTTP client per-`(host, path)`, cumulative since `init()` / last `clearCppApiStats()`. |
 | `clearCppApiStats()` | Reset Layer C counters only. |
-| `reportCppFlow(rawUrl, txBytes, rxBytes, durationMs)` | JNI entry point. Called by the native bridge (`docs/cpp-bridge/`) — not typically called from Kotlin. `@JvmStatic`. |
-| `setLogInterval(seconds: Int)` | Start / stop periodic `adb logcat` reports (tag `NetScope`). Pass `0` to stop. |
-| `setOnFlowEnd(cb?)` | Register per-flow-close callback. Pass `null` to clear. |
-| `destroy()` | Stop the reporter and clear state. Instrumentation stays in the bytecode; rebuild without the plugin to fully remove. |
+| `reportCppFlow(rawUrl, txBytes, rxBytes, durationMs)` | JNI entry point called by the C++ bridge — not called from Kotlin directly. `@JvmStatic`. |
+| `setLogInterval(seconds: Int)` | Start / stop periodic logcat report (tag `NetScope`). Pass `0` to stop. |
+| `setOnFlowEnd(cb?)` | Per-flow-close callback for Layer B. Pass `null` to clear. |
+| `destroy()` | Stop reporter, clear state. Bytecode instrumentation remains; rebuild without the plugin to remove it. |
 
-### `ApiStats` (data class)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `host` | `String` | Target host. May include `:port` when non-default for the scheme (`api.example.com:8080`, `192.168.1.5:9000`). Unresolvable hosts surface as `<unknown>` (or `<unknown>:port` when port is known). |
-| `path` | `String` | Normalised URL path. Always starts with `/`; numeric IDs → `:id`, UUIDs → `:uuid`, long hex strings → `:hash`. Query and fragment stripped. |
-| `key` | `String` | Derived: `"$host$path"`, e.g. `api.example.com/v1/users/:id`. Stable identifier. |
-| `txBytesTotal` / `rxBytesTotal` | `Long` | Cumulative bytes |
-| `txBytesInterval` / `rxBytesInterval` | `Long` | Bytes in current / last interval window |
-| `connCountTotal` / `connCountInterval` | `Int` | Closed-flow counts |
-| `lastActiveMs` | `Long` | `System.currentTimeMillis()` of last activity |
-| `totalBytes` | `Long` | Computed: `txBytesTotal + rxBytesTotal` |
-
-### `TotalStats` (data class)
+### `ApiStats` (data class, Layer B)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `txTotal` / `rxTotal` | `Long` | Kernel-counted bytes for our UID since `init()` (covers Java + native + NDK). Falls back to AOP sum on pre-Q OEM kernels that return `TrafficStats.UNSUPPORTED`. |
-| `connCountTotal` | `Int` | AOP-observed Java-layer flow-close count. Kernel has no "connection close" concept for native sockets, so this stays Java-only. |
-| `totalBytes` | `Long` | Computed: `txTotal + rxTotal` |
+| `host` | `String` | Formatted endpoint. Default port for scheme is elided (`api.example.com`); non-default port appended (`api.example.com:8080`); raw IPs pass through (`192.168.1.5:9000`); unresolvable → `<unknown>`. |
+| `path` | `String` | Normalised path. Always starts with `/`. Numeric IDs → `:id`, UUIDs → `:uuid`, long hex → `:hash`. Query/fragment stripped. |
+| `key` | `String` | `"$host$path"` — stable identifier, e.g. `api.example.com/v1/users/:id`. |
+| `txBytesTotal` / `rxBytesTotal` | `Long` | Cumulative bytes sent / received. |
+| `txBytesInterval` / `rxBytesInterval` | `Long` | Bytes in the current / last interval window. |
+| `connCountTotal` / `connCountInterval` | `Int` | Closed-flow counts. |
+| `lastActiveMs` | `Long` | `System.currentTimeMillis()` of last activity. |
+| `totalBytes` | `Long` | `txBytesTotal + rxBytesTotal`. |
+
+### `TotalStats` (data class, Layer A)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `txTotal` / `rxTotal` | `Long` | Kernel-counted bytes for the app's UID since `init()`. Falls back to AOP sum on pre-Q kernels returning `TrafficStats.UNSUPPORTED`. |
+| `connCountTotal` | `Int` | AOP-observed Java-layer flow-close count (kernel has no per-connection close event). |
+| `totalBytes` | `Long` | `txTotal + rxTotal`. |
 
 ### `CppApiStats` (data class, Layer C)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `host` | `String` | Target host (formatted same as `ApiStats.host`). |
-| `path` | `String` | Normalised URL path (same rules as `ApiStats.path`). |
-| `key` | `String` | Derived: `"$host$path"`. |
+| `host` | `String` | Same formatting rules as `ApiStats.host`. |
+| `path` | `String` | Same normalisation rules as `ApiStats.path`. |
+| `key` | `String` | `"$host$path"`. |
 | `txBytes` / `rxBytes` | `Long` | Cumulative bytes since `init()` / last `clearCppApiStats()`. |
-| `requestCount` | `Int` | Number of completed C++ HTTP requests. |
-| `totalTransferTimeMs` | `Double` | Sum of per-request transfer times in milliseconds. |
-| `totalBytes` | `Long` | Computed: `txBytes + rxBytes`. |
-| `avgTransferTimeMs` | `Double` | Computed: `totalTransferTimeMs / requestCount`. |
+| `requestCount` | `Int` | Number of completed C++ HTTP requests reported. |
+| `totalTransferTimeMs` | `Double` | Sum of per-request transfer times (ms). |
+| `totalBytes` | `Long` | `txBytes + rxBytes`. |
+| `avgTransferTimeMs` | `Double` | `totalTransferTimeMs / requestCount` (0 if no requests). |
 
 ### `SocketStats` (data class, Layer D)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `remoteAddress` | `String` | `"203.0.113.1:443"` format — IP + port as seen by `connect()`. |
+| `remoteAddress` | `String` | `"203.0.113.1:443"` — IP and port as seen by `connect()`. |
 | `txBytes` / `rxBytes` | `Long` | Cumulative bytes since last `clearSocketStats()`. |
-| `connectionCount` | `Int` | Number of `close()` calls on fds that connected to this address. |
-| `totalBytes` | `Long` | Computed: `txBytes + rxBytes`. |
+| `connectionCount` | `Int` | Number of `close()` events on fds connected to this address. |
+| `totalBytes` | `Long` | `txBytes + rxBytes`. |
 
 ### `SocketTotalStats` (data class, Layer D)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `txTotal` / `rxTotal` | `Long` | Sum of all `SocketStats.txBytes` / `rxBytes`. |
-| `connectionCount` | `Int` | Total closed connections across all addresses. |
-| `totalBytes` | `Long` | Computed: `txTotal + rxTotal`. |
+| `txTotal` / `rxTotal` | `Long` | Sum across all `SocketStats` entries. |
+| `connectionCount` | `Int` | Total closed connections across all remote addresses. |
+| `totalBytes` | `Long` | `txTotal + rxTotal`. |
 
 ### `NetScopeHook` (object, in `netscope-hook`)
 
-| Method | Description |
-|--------|-------------|
-| `init(context)` | Loads `libnetscope_hook.so` via `System.loadLibrary`. Silent on failure (missing ABI, W^X kernel, etc.). |
-| `start(): Boolean` | Installs GOT hooks. Returns `false` if `init()` failed or patching failed. |
+| Method / Property | Description |
+|-------------------|-------------|
+| `init(context)` | Loads `libnetscope_hook.so` via `System.loadLibrary`. Silent on failure (unsupported ABI, W^X kernel, etc.). Must be called before `start()`. |
+| `start(): Boolean` | Installs GOT hooks on all currently-loaded `.so` files. Returns `false` if `init()` failed or the patcher encountered an error. |
 | `stop()` | Uninstalls GOT hooks, restoring original function pointers. |
 | `isActive: Boolean` | Whether hooks are currently installed. |
-| `getSocketStats(): List<SocketStats>` | **Layer D.** Per-`IP:port` stats snapshot. |
-| `getSocketTotalStats(): SocketTotalStats` | **Layer D.** Total across all sockets. Compare `txTotal` to `getTotalStats().txTotal` for cross-validation. |
-| `clearSocketStats()` | Reset Layer D counters. |
+| `getSocketStats(): List<SocketStats>` | **Layer D.** Per-`IP:port` snapshot. Only connections that have been `close()`d appear; in-flight fds are not yet reported. Sorted by total bytes desc. |
+| `getSocketTotalStats(): SocketTotalStats` | **Layer D.** Sum across all tracked addresses. Compare `txTotal` to `NetScope.getTotalStats().txTotal` for cross-validation. |
+| `clearSocketStats()` | Reset Layer D counters. Hooks remain active; new stats accumulate from this point. |
 
-## Logcat Output Format
+---
+
+## API key shape
+
+Both `ApiStats` (Layer B) and `CppApiStats` (Layer C) use the same
+`host + path` key shape, so you can compare them row-by-row:
+
+| Field | Example |
+|-------|---------|
+| `host` | `api.example.com` — default port elided |
+| | `api.example.com:8080` — non-default port shown |
+| | `192.168.1.5:9000` — raw IP |
+| | `<unknown>` — unresolvable host |
+| `path` | `/v1/users` — verbatim |
+| | `/v1/users/:id` — numeric segment templated |
+| | `/accounts/:uuid/avatar` — UUID templated |
+| | `/file/:hash` — long hex templated |
+| | Query (`?q=…`) and fragment (`#…`) stripped; trailing slash dropped |
+
+---
+
+## Which URLs get counted (Layer B)
+
+The Transform rewrites every `URLConnection.getInputStream()` /
+`getOutputStream()` call site. At runtime NetScope classifies by scheme:
+
+| URL | Counted? | Reason |
+|-----|----------|--------|
+| `http://…`, `https://…` | yes | network |
+| `ftp://…`, `sftp://…`, custom socket schemes | yes | touches the wire |
+| `jar:http://host/x.jar!/entry` | yes | inner URL is remote |
+| `file:/data/…` | **no** | local filesystem |
+| `content://…` | **no** | Android ContentProvider |
+| `asset:`, `android.resource:`, `res:`, `data:` | **no** | local |
+| `jar:file:/…!/entry` | **no** | inner URL is local |
+
+The classifier uses a **denylist** (not an allowlist). A new
+over-the-wire transport like `quic:` is counted by default.
+
+---
+
+## Logcat Output
 
 ```
-I NetScope: ══════ Traffic Report [2026-04-24 12:00:00] ══════
-I NetScope: ── Interval ──────────────────────────────
-I NetScope:   api.github.com/repos/:id/issues                              ↑1.2 KB    ↓45.6 KB   conn=3
-I NetScope:   www.google.com/complete/search                               ↑0.8 KB    ↓12.1 KB   conn=1
-I NetScope:   192.168.1.5:9000/telemetry                                   ↑0.1 KB    ↓0.3 KB    conn=1
-I NetScope: ── Cumulative ────────────────────────────
-I NetScope:   api.github.com/repos/:id/issues                              ↑8.4 KB    ↓312.0 KB  conn=21
-I NetScope:   api.github.com/user/:id                                      ↑1.1 KB    ↓4.2 KB    conn=3
-I NetScope:   www.google.com/complete/search                               ↑3.2 KB    ↓88.7 KB   conn=7
-I NetScope: ── Total (kernel UID, since init) ────────
-I NetScope:   ↑18.3 KB  ↓512.0 KB  conn=28
-I NetScope:   non-instrumented (native/NDK): 118.2 KB
-I NetScope: ═════════════════════════════════════════
+I NetScope: ══════ Traffic Report [2026-05-04 12:00:00] ══════
+I NetScope: ── Layer B: Interval (Java AOP) ───────────────
+I NetScope:   api.example.com/v1/location           ↑1.2 KB  ↓45.6 KB  conn=3
+I NetScope:   api.example.com/v1/map-tiles          ↑0.8 KB  ↓12.1 KB  conn=1
+I NetScope: ── Layer B: Cumulative ──────────────────────
+I NetScope:   api.example.com/v1/location           ↑8.4 KB  ↓312.0 KB conn=21
+I NetScope: ── Layer C: C++ HTTP (cumulative) ───────────
+I NetScope:   api.example.com/v1/location           ↑7.9 KB  ↓308.1 KB req=20
+I NetScope: ── Layer A: Total (kernel UID, since init) ──
+I NetScope:   ↑18.3 KB  ↓512.0 KB
+I NetScope:   unattributed (A − B − C): 3.0 KB
+I NetScope: ═════════════════════════════════════════════
 ```
 
-## What gets instrumented
+---
 
-| Target method | Effect |
-|---|---|
-| `OkHttpClient.Builder.build()` | Prepended with `NetScopeInterceptorInjector.addIfMissing(this)` — idempotent, will not double-add if you've added the interceptor manually. |
-| `URLConnection.getInputStream()` / `getOutputStream()` (including `HttpURLConnection` / `HttpsURLConnection`) | Return value wrapped in a counting `FilterInputStream` / `FilterOutputStream`. |
-| `OkHttpClient.newWebSocket(Request, WebSocketListener)` | Listener wrapped to count inbound frames; returned `WebSocket` wrapped to count outbound `send(...)`. |
+## What gets instrumented (Layer B)
 
-### Classes the Transform skips (call-site rewrite only)
+| Target | Effect |
+|--------|--------|
+| `OkHttpClient.Builder.build()` | Inserts `NetScopeInterceptorInjector.addIfMissing(this)` — idempotent. |
+| `URLConnection.getInputStream()` / `getOutputStream()` | Return value wrapped in a counting `FilterInputStream` / `FilterOutputStream`. |
+| `OkHttpClient.newWebSocket(Request, WebSocketListener)` | Listener and returned `WebSocket` both wrapped. |
 
-The Transform does not rewrite call sites that live inside the
-following packages:
+### Classes the Transform skips
 
-| Skipped prefix | Why it must be skipped |
-|---|---|
-| `okhttp3/`, `okio/` | OkHttp internally constructs `OkHttpClient` (redirect handlers, `Dispatcher`, etc.); rewriting these call sites would cause `NetScopeInterceptor` to be re-applied on top of itself. |
-| `java/`, `javax/`, `android/`, `androidx/`, `com/android/`, `com/google/android/`, `dalvik/` | Boot classpath + Android framework + AndroidX + GMS. These classes are loaded from the platform / shared classloaders and any rewrites we ship are not actually used at runtime. |
-| `kotlin/`, `kotlinx/` | Kotlin stdlib — same reason as above. |
-| `$ajc$`, `$AjcClosure` | AspectJ-synthesised classes. Leaving them alone keeps AspectJ weaving correct. |
-| `indi/arrowyi/netscope/...` | NetScope's own runtime, to prevent self-loops. |
+| Skipped prefix | Reason |
+|----------------|--------|
+| `okhttp3/`, `okio/` | OkHttp internally creates `OkHttpClient` instances; re-wrapping causes self-loops. |
+| `java/`, `javax/`, `android/`, `androidx/`, `com/android/`, `com/google/android/`, `dalvik/` | Platform / framework / AndroidX / GMS — loaded from shared classloaders; rewrites are never used at runtime. |
+| `kotlin/`, `kotlinx/` | Kotlin stdlib — same reason. |
+| `$ajc$`, `$AjcClosure` | AspectJ synthetic classes — skip preserves AspectJ weaving. |
+| `indi/arrowyi/netscope/` | NetScope's own runtime — prevents self-loops. |
 
-> **This is a *call-site* skip, not a *traffic* skip.** Bytes that flow
-> through these classes still count in `getTotalStats()` (kernel
-> `TrafficStats`). They simply do not appear in `getApiStats()`'s
-> per-API breakdown and surface as part of the `total - sum(apis)`
-> gap.
+> **Call-site skip ≠ traffic skip.** Traffic from skipped packages still
+> appears in `getTotalStats()` (Layer A) and in `getSocketStats()` (Layer D).
+> It is absent only from `getApiStats()` (Layer B).
 
-#### Per-API blind spots this creates
+### Realistic Layer B blind spots
 
-`getApiStats()` is computed at the *caller* side of three OkHttp /
-URLConnection methods. If the caller class lives under a skipped
-prefix, that flow is invisible to the per-API breakdown. The
-following are the realistic cases to be aware of:
+| Source | Missing from `getApiStats()` |
+|--------|------------------------------|
+| GMS / Firebase / FCM / Maps | All GMS-internal HTTP |
+| AndroidX Media3 / ExoPlayer | Streaming media traffic |
+| AndroidX WorkManager / Browser | Background HTTP, custom-tab prefetch |
+| `DownloadManager`, sync adapters | Java-side Android framework downloads |
+| Vendor AARs under `com.android.*` / `com.google.android.*` | All HTTP from those AARs |
+| AspectJ `$AjcClosure`-woven calls | The woven call site is in a synthetic class |
 
-| Source | Skipped prefix that hides it | What you lose from `getApiStats()` |
-|---|---|---|
-| Google Play Services / Firebase / FCM / Maps / Crashlytics / Auth | `com/google/android/` (`com.google.android.gms.*`, `com.google.android.libraries.*`) | All GMS-internal HTTP — token refresh, push long-poll, map tiles, crash uploads. |
-| AndroidX Media3 / ExoPlayer streaming | `androidx/` (`androidx.media3.*`) | Streaming media DataSource traffic — usually the largest single contributor on car / video apps. |
-| AndroidX WorkManager constraint pings, AndroidX Browser custom tabs | `androidx/` | Background HTTP for scheduled work, custom-tab prefetch. |
-| Android framework HTTP (DownloadManager, sync adapters, some WebView fallbacks) | `android/`, `com/android/` | Java-side downloads / sync. WebView itself is mostly native and outside Layer B regardless. |
-| Vendor / OEM AAR whose package is `com.android.*` or `com.google.android.*` | `com/android/`, `com/google/android/` | Whatever HTTP that AAR makes. Common on automotive / HMI projects integrating prebuilt AARs. |
-| Business code accidentally obfuscated into `androidx.*` / `com.android.*` by ProGuard rules | matches the prefix | Same as a vendor AAR — looks like the plugin "stopped working" in release. |
-| Network calls woven by AspectJ into `$AjcClosure` synthetic classes | `$AjcClosure` | The original call site moves into a synthetic class that NetScope leaves alone. |
+In all cases the traffic is visible in Layer A (`getTotalStats()`) and,
+if the socket hook is enabled, in Layer D (`getSocketStats()`).
 
-In every case above the **traffic itself is still counted by
-`getTotalStats()`** and surfaces inside the `total - sum(apis)`
-difference. The HMI / dashboard label "non-instrumented (native/NDK)"
-in the logcat sample is therefore a slight under-spec — that bucket
-contains *both* genuine native traffic *and* Java traffic from the
-skipped packages above. Treat it as "unattributed" rather than
-"native".
+---
 
-#### Mitigations
+## No double counting within Layer B
 
-- **Pin the plugin order.** Always apply `indi.arrowyi.netscope`
-  *after* AspectJ. Reversing the order leaves AspectJ trying to weave
-  over already-rewritten call sites and can fail at compile time.
-- **Always render the gap.** UI / telemetry that surfaces per-API
-  bytes should also surface `total - sum(apis)` as an "unattributed"
-  row, not silently drop it.
-- **Audit vendor AAR packages.** If integrating a prebuilt AAR whose
-  package falls under `com/android/` or `com/google/android/`, expect
-  it to be invisible to `getApiStats()`. If you need per-API
-  visibility for it, repackage / consider lifting that prefix from
-  the skip list (and re-test `Interceptor` chain compatibility — see
-  next bullet).
-- **Lifting a skip prefix is possible but risky.** For projects that
-  must split GMS / ExoPlayer per-endpoint, the skip list in
-  `NetScopeTransform.kt` can be relaxed for specific prefixes.
-  Validate carefully: those libraries internally construct
-  `OkHttpClient`s used as building blocks (e.g. ExoPlayer's
-  `OkHttpDataSource.Factory`), and adding `NetScopeInterceptor` into
-  every one of them may interact with their own interceptor chains.
-  Roll out behind a build flag and verify on a real device.
+Every NetScope wrapper implements the `NetScopeInstrumented` marker
+interface. Both the Transform and the runtime injectors check for it
+before wrapping:
+
+- Transform + manual `addInterceptor(NetScopeInterceptor)` = **1× count**
+- A `URLConnection` already wrapped won't be double-wrapped by a nested call site
+- OkHttp on top of a wrapped `URLConnection` — only the top-most wrapper counts
+
+Layers B, C, and D are independent — the same request appears in each.
+Never sum them.
+
+---
 
 ## Known Limitations
 
-- **Raw `OkHttpClient()` no-arg constructor** bypasses the Builder path
-  and is therefore not visible in `getApiStats()`. Its traffic IS still
-  counted in `getTotalStats()` (kernel-level). Prefer
-  `OkHttpClient.Builder().build()` if you want the per-API breakdown.
-- **Reflection-constructed HTTP clients** are not instrumented — per-
-  API stats will miss them. `getTotalStats()` still includes their
-  traffic.
-- **Native HTTP clients** (NDK code, WebView / Chromium, libcurl via
-  JNI) show up in `getTotalStats()` but not `getApiStats()`. Compute
-  `total - sum(apis)` to surface this gap.
-- **`java.net.Socket` direct use** is not per-API-instrumented but is
-  counted in the kernel total.
-- **Third-party libraries whose call sites live under skipped
-  packages** (GMS, Firebase, AndroidX Media3 / ExoPlayer, vendor AARs
-  shipped under `com.android.*` / `com.google.android.*`, AspectJ
-  `$AjcClosure`-woven calls) are absent from `getApiStats()`. Their
-  traffic is still counted in `getTotalStats()` and surfaces in the
-  `total - sum(apis)` gap. See
-  [Per-API blind spots this creates](#per-api-blind-spots-this-creates)
-  for the full list and mitigations.
-- **Path templating is heuristic.** `:id`/`:uuid`/`:hash` are applied
-  per segment based on regex, so `/articles/some-natural-slug` stays
-  literal (desired) but a numeric slug like `/articles/2026` collapses
-  to `/articles/:id` (may be too aggressive for editorial APIs). A
-  pluggable normaliser is on the roadmap if host apps need custom
-  rules.
-- **`pause()`** suspends Layer B (per-API) counting but does NOT
-  suspend Layer A (kernel total). The kernel keeps counting regardless
-  of SDK state.
-- **Pre-Q OEM kernels** returning `TrafficStats.UNSUPPORTED` (-1) fall
-  back to reporting the AOP sum in `getTotalStats()`. Rare on devices
-  shipping API 26+.
-- **Non-incremental Transform.** To allow vendor AAR call sites to be
-  instrumented without tripping AGP 4.x's
-  `mixed_scope_dex_archive` wide-scope duplicate-class collapse,
-  NetScope's Transform reproduces AGP's scope-priority dedupe itself.
-  That requires a fresh global seen-set each run, so the Transform
-  opts out of incremental builds. Full rebuilds cost a few seconds
-  more; the per-class bytecode prefilter keeps this minimal. Vendor
-  AAR call sites ARE covered by `getApiStats()`.
-- **Plugin order matters.** If AspectJ is also in the build, apply
-  it **before** NetScope. NetScope skips `$ajc$` / `$AjcClosure`
-  classes so AspectJ's weaving is preserved, but reversing the order
-  can leave AspectJ trying to weave over already-rewritten call
-  sites.
+- **`OkHttpClient()` no-arg constructor** bypasses the Builder and is
+  invisible to Layer B. Traffic still counted in Layer A and D.
+- **Reflection-constructed HTTP clients** are not instrumented in Layer B.
+- **Native HTTP clients** (NDK, WebView/Chromium, libcurl via JNI) are not
+  in Layer B. They appear in Layer A; with Layer D enabled they appear in
+  `getSocketStats()` as `IP:port` entries.
+- **`java.net.Socket` direct use** — not in Layer B; visible in Layer A and D.
+- **GMS / AndroidX / vendor AARs under skipped packages** — not in Layer B;
+  in Layer A and D. See [Realistic Layer B blind spots](#realistic-layer-b-blind-spots).
+- **Path templating is heuristic.** `/articles/2026` → `/articles/:id`; a
+  natural slug like `/articles/hello-world` stays literal. Custom rules via a
+  pluggable `PathNormalizer` are on the roadmap.
+- **`pause()`** suspends Layer B only. Layer A kernel total keeps counting.
+- **Layer D counts only closed connections.** In-flight fds are not yet
+  reported. Long-lived connections (keep-alive, streaming) may appear late.
+- **Layer D covers TCP sockets.** UDP (DNS, QUIC) is not tracked by the
+  `connect` / `send` / `recv` path in libc.
+- **Pre-Q OEM kernels** returning `TrafficStats.UNSUPPORTED` fall back to
+  the AOP sum in `getTotalStats()`.
+- **Non-incremental Transform.** Scope-priority dedupe requires a fresh
+  global seen-set each build run; incremental builds are disabled. Full
+  rebuilds cost a few extra seconds; the per-class prefilter keeps this low.
+- **Plugin order matters.** Apply AspectJ **before** `indi.arrowyi.netscope`.
+
+---
 
 ## Build from Source
 
@@ -544,17 +476,26 @@ skipped packages above. Treat it as "unattributed" rather than
 git clone git@github.com:Arrowyi/NetScope.git
 cd NetScope
 
-# Build the SDK AAR (pure Kotlin, zero native libs):
+# SDK AAR (pure Kotlin, zero native libs)
 ./gradlew :netscope-sdk:assembleRelease
 # → netscope-sdk/build/outputs/aar/netscope-sdk-release.aar
 
-# Build the Gradle plugin (composite build):
+# Hook module AAR (requires NDK r25c)
+./gradlew :netscope-hook:assembleRelease
+# → netscope-hook/build/outputs/aar/netscope-hook-release.aar
+
+# Gradle plugin (composite build)
 ./gradlew -p netscope-plugin jar
 # → netscope-plugin/build/libs/netscope-plugin-<version>.jar
 
-# Sample app (demonstrates the zero-touch integration):
+# Unit tests
+./gradlew :netscope-sdk:test
+
+# Sample app
 ./gradlew :app:assembleDebug
 ```
+
+---
 
 ## License
 
