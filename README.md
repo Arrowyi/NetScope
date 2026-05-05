@@ -61,6 +61,11 @@ that fd is flushed into a per-`IP:port` aggregation table.
 The patcher uses only `dl_iterate_phdr` + `mprotect` on existing pages —
 no `mmap(PROT_EXEC)`, no third-party hook libraries, W^X-kernel-safe.
 
+Because `libcurl` (used internally by `tn::http::client`) calls the same
+libc socket functions, Layer D captures C++ HTTP traffic at the wire level,
+including TLS handshake bytes that Layer C does not count. DNS queries via
+`c-ares` (UDP `sendto` / `recvfrom`) are hooked too.
+
 ```
   Java OkHttp / URLConnection / WebSocket
           │
@@ -200,17 +205,68 @@ and WebSockets are instrumented at build time.
 
 ### Step 4 — Layer C: C++ HTTP client integration *(optional)*
 
-If your native build uses `tn::http::client`, copy the two reference
-files from `docs/cpp-bridge/` into your HMI native source tree and call
-`netscope_install_cpp_hook()` once during native initialisation (e.g.
-inside `JNI_OnLoad` or alongside `DataUsageCollector::install()`):
+#### How the integration works (decoupled design)
+
+NetScope does **not** link against `tn::http::client` or any HMI native
+library. The bridge is a thin adapter that the HMI team drops into their
+own native build. It depends only on:
+
+- `<foundation/http/client.hpp>` — already on the HMI include path
+- `<jni.h>` — standard NDK header
+- The SDK JAR on the Java classpath (for `NetScope.reportCppFlow()`)
+
+Neither `libnetscope.so` nor `libnetscope_hook.so` appears in the
+bridge's `DT_NEEDED`.
+
+#### `tn::http::client` callback API
+
+The integration point is the global option injector declared in
+`<foundation/http/client.hpp>`:
+
+**tasdk-android-unified** (public namespace function — callable directly):
+```cpp
+// namespace tn::http::client::restricted
+TASDK_FOUNDATION_API void injectGlobalOption(OptionSetter opt);
+```
+
+**navcore** (private static in a friend class — only `InternalEvtMgr` has access):
+```cpp
+class restricted {
+    friend class tn::datasense::InternalEvtMgr;
+    static void injectGlobalOption(OptionSetter opt);  // NOT callable from HMI code
+};
+```
+
+> **navcore limitation:** `injectGlobalOption` is `private` in navcore.
+> The reference bridge files work with tasdk-android-unified but not with
+> a navcore build as-is. In that case use the tasdk headers, or request
+> that the navcore team expose the method.
+
+The `ResponseListener` callback signature is identical in both SDKs:
+```cpp
+using ResponseListener = std::function<void(const Response&)>;
+// On completion, res provides:
+//   res.request().url()       — full request URL
+//   res.bytesSent()           — bytes sent (size_t)
+//   res.bytesReceived()       — bytes received (size_t)
+//   res.totalTransferTime()   — wall-clock seconds (double)
+```
+
+#### Installation
+
+Copy `docs/cpp-bridge/netscope_cpp_bridge.{h,cpp}` into your HMI native
+source tree (e.g. alongside `DataUsageCollector.cpp`) and call
+`netscope_install_cpp_hook()` once during native initialisation:
 
 ```cpp
-// In your JNI_OnLoad or equivalent:
+// In JNI_OnLoad or next to DataUsageCollector::install():
 #include "netscope_cpp_bridge.h"
 
 netscope_install_cpp_hook(env, nullptr);   // idempotent, thread-safe
 ```
+
+The two global options (DataUsageCollector's and NetScope's) coexist —
+`injectGlobalOption` chains them, it does not replace one with the other.
 
 No Kotlin-side changes are needed — stats accumulate into
 `NetScope.getCppApiStats()` automatically.
@@ -219,22 +275,42 @@ No Kotlin-side changes are needed — stats accumulate into
 
 ## Querying the Four Layers
 
+### Per-API breakdown
+
 ```kotlin
-// Layer A — kernel ground truth
+// Layer A — kernel ground truth (UID total, no per-API)
 val total: TotalStats = NetScope.getTotalStats()
 
-// Layer B — Java AOP per-API
-val apiStats: List<ApiStats>  = NetScope.getApiStats()
-val interval: List<ApiStats>  = NetScope.getIntervalStats()
+// Layer B — Java AOP, per (host + path)
+val apiStats: List<ApiStats> = NetScope.getApiStats()       // cumulative
+val interval: List<ApiStats> = NetScope.getIntervalStats()  // last interval
 
-// Layer C — C++ HTTP client per-API
+apiStats.forEach { s ->
+    Log.d("NetScope", "[B] ${s.key}  ↑${s.txBytesTotal}  ↓${s.rxBytesTotal}  flows=${s.connCountTotal}")
+}
+// s.key == "api.example.com/v1/users/:id"
+
+// Layer C — C++ HTTP client (tn::http::client), per (host + path)
 val cppStats: List<CppApiStats> = NetScope.getCppApiStats()
 
-// Layer D — socket hook per-IP:port
-val sockets:  List<SocketStats>  = NetScopeHook.getSocketStats()
-val sockTotal: SocketTotalStats  = NetScopeHook.getSocketTotalStats()
+cppStats.forEach { s ->
+    Log.d("NetScope", "[C] ${s.key}  ↑${s.txBytes}  ↓${s.rxBytes}  req=${s.requestCount}  avg=${"%.1f".format(s.avgTransferTimeMs)}ms")
+}
+// s.key uses the same "host/path" shape as Layer B — rows can be compared directly
 
-// Cross-validation example
+// Layer D — socket hook, per remote IP:port (not host+path — socket level has no hostname)
+val sockets:   List<SocketStats>  = NetScopeHook.getSocketStats()
+val sockTotal: SocketTotalStats   = NetScopeHook.getSocketTotalStats()
+
+sockets.forEach { s ->
+    Log.d("NetScope", "[D] ${s.remoteAddress}  ↑${s.txBytes}  ↓${s.rxBytes}  conn=${s.connectionCount}")
+}
+// s.remoteAddress == "203.0.113.1:443"
+```
+
+### Cross-validation
+
+```kotlin
 val bTx = apiStats.sumOf { it.txBytesTotal }
 val cTx = cppStats.sumOf { it.txBytes }
 val dTx = sockTotal.txTotal
@@ -444,6 +520,10 @@ Never sum them.
 
 ## Known Limitations
 
+- **Layer C on navcore builds:** `tn::http::client::restricted::injectGlobalOption`
+  is a `private static` method in navcore (accessible only via `InternalEvtMgr`).
+  The reference bridge in `docs/cpp-bridge/` works with **tasdk-android-unified**
+  only. For navcore, request access or use Layer D (socket hook) as a substitute.
 - **`OkHttpClient()` no-arg constructor** bypasses the Builder and is
   invisible to Layer B. Traffic still counted in Layer A and D.
 - **Reflection-constructed HTTP clients** are not instrumented in Layer B.
